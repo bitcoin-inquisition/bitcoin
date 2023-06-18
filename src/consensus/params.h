@@ -33,6 +33,7 @@ enum DeploymentPos : uint16_t {
     DEPLOYMENT_TESTDUMMY,
     DEPLOYMENT_CHECKTEMPLATEVERIFY, // Deployment of CTV (BIP 119)
     DEPLOYMENT_ANYPREVOUT,
+    DEPLOYMENT_ANNEX,
     // NOTE: Also add new deployments to VersionBitsDeploymentInfo in deploymentinfo.cpp
     MAX_VERSION_BITS_DEPLOYMENTS
 };
