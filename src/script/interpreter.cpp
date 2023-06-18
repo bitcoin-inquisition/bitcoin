@@ -1947,6 +1947,18 @@ bool GenericTransactionSignatureChecker<T>::CheckDefaultCheckTemplateVerifyHash(
         return HandleMissingData(m_mdb);
     }
 }
+
+template <class T>
+bool GenericTransactionSignatureChecker<T>::CheckTxWeight(const std::vector<unsigned char>& max_weight) const
+{
+    std::string max_weight_str{max_weight.begin(), max_weight.end()};
+    int record_weight = std::stoi(max_weight_str, nullptr);
+    CTransaction tx = CTransaction(*txTo);
+    if (record_weight > GetTransactionWeight(tx)) return false;
+    return true;
+}
+
+
 // explicit instantiation
 template class GenericTransactionSignatureChecker<CTransaction>;
 template class GenericTransactionSignatureChecker<CMutableTransaction>;
@@ -2017,7 +2029,7 @@ uint256 ComputeTaprootMerkleRoot(Span<const unsigned char> control, const uint25
     return k;
 }
 
-bool VerifyAnnex(const std::vector<unsigned char>& annex_vec, AnnexValidationResult& result)
+bool VerifyAnnex(const std::vector<unsigned char>& annex_vec, AnnexValidationResult& result, const BaseSignatureChecker& checker)
 {
 	CDataStream annex(MakeByteSpan(annex_vec), ANNEX_SER_TYPE, ANNEX_SER_VERSION);
 
@@ -2056,9 +2068,22 @@ bool VerifyAnnex(const std::vector<unsigned char>& annex_vec, AnnexValidationRes
 		switch (nRecordType) {
 			/* Consensus rule : record value must make sense, per
 			 * the tag spec. */
-			case ANNEX_RECORD_POLICY_RESERVED:
+			case ANNEX_RECORD_POLICY_RESERVED: 
+            {
 				/* No consensus validation on unstructured data */
 				continue;
+            }
+            break;
+
+            case ANNEX_RECORD_MAX_TX_WEIGHT:
+            {
+                if (!checker.CheckTxWeight(vRecordValue)) {
+                    result = AnnexValidationResult::FAILURE;
+                    return false;
+                }
+            }
+            break;
+
 			default:
 				result = AnnexValidationResult::UNKNOWN_RECORD;
 				return true;
@@ -2125,7 +2150,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
 			// BIPXXX: verify annex
 			if (flags & SCRIPT_VERIFY_ANNEX) {
 				AnnexValidationResult result;
-				VerifyAnnex(annex, result);
+				VerifyAnnex(annex, result, checker);
 				if (result == AnnexValidationResult::FAILURE) {
 					return set_error(serror, SCRIPT_ERR_ANNEX_WRONG_FORMAT);
 				}
