@@ -301,6 +301,9 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs,
 
                 // limit annex format to allow for future expansion
                 if (annex.size() < 2 || annex.size() != static_cast<size_t>(annex[1]) + 2) return false;
+
+                // Verify the annex format is standard with no unknown records present
+                if (!IsAnnexStandard(annex)) return false;
             }
             if (stack.size() >= 2) {
                 // Script path spend (2 or more stack elements after removing optional annex)
@@ -333,6 +336,14 @@ size_t HasPayToAnchor(const CTransaction& tx)
         }
     }
     return false;
+}
+
+bool IsAnnexStandard(const std::vector<unsigned char>& annex)
+{
+    AnnexValidationResult result;
+    VerifyAnnex(annex, result);
+    if (result == AnnexValidationResult::FAILURE || result == AnnexValidationResult::UNKNOWN_RECORD) return false;
+    return true;
 }
 
 int64_t GetVirtualTransactionSize(int64_t nWeight, int64_t nSigOpCost, unsigned int bytes_per_sigop)

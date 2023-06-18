@@ -140,6 +140,8 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
 */
 bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs, bool allow_annex_data);
 
+bool IsAnnexStandard(const std::vector<unsigned char>& annex_stack);
+
 /**
 * Check if given transaction has a IsPayToAnchor output.
 **/
