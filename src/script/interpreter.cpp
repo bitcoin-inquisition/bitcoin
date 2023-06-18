@@ -10,6 +10,7 @@
 #include <crypto/sha256.h>
 #include <pubkey.h>
 #include <script/script.h>
+#include <streams.h>
 #include <uint256.h>
 
 typedef std::vector<unsigned char> valtype;
@@ -2016,6 +2017,52 @@ uint256 ComputeTaprootMerkleRoot(Span<const unsigned char> control, const uint25
     return k;
 }
 
+bool VerifyAnnex(const std::vector<unsigned char>& annex_vec)
+{
+	CDataStream annex(MakeByteSpan(annex_vec), ANNEX_SER_TYPE, ANNEX_SER_VERSION);
+
+	/* Pop annex tag */
+	uint8_t annex_tag;
+	annex.read(AsWritableBytes(Span{&annex_tag, 1}));
+	assert(annex_tag == ANNEX_TAG);
+
+	uint64_t nRecordType = 0;
+	while (!annex.empty()) {
+
+		/* We encode the difference between the previous type (initially 0),
+		 * both minimising the encoding and ensuring a canonical ordering
+		 * for record value. */
+		uint64_t nRecordDeltaLen = 0;
+		annex >> VARINT(nRecordDeltaLen);
+		nRecordType = nRecordType + (nRecordDeltaLen >> 7);
+		/* The record length is encoded as a delta */
+		uint64_t nRecordLength = nRecordDeltaLen & 0x7f;
+		if (nRecordLength == 0x7F) {
+			uint64_t nBuffRecordLength = 0;
+			annex >> VARINT(nBuffRecordLength);
+			nRecordLength += nBuffRecordLength;
+		}
+
+		/* Consensus rule: the annex is not short - end of data
+		 * before reading is finished. */
+		if (annex.size() < nRecordLength)
+			return false;
+
+		std::vector<unsigned char> vRecordValue;
+		vRecordValue.resize(nRecordLength);
+		annex.read(AsWritableBytes(Span{&vRecordValue, nRecordLength}));
+
+		switch (nRecordType) {
+			/* Consensus rule : record value must make sense, per
+			 * the tag spec */
+			default:
+
+				return true;
+		}
+	}
+	return true;
+}
+
 static bool VerifyTaprootCommitment(const std::vector<unsigned char>& control, const std::vector<unsigned char>& program, const uint256& tapleaf_hash, std::optional<XOnlyPubKey>& internal_key)
 {
     assert(control.size() >= TAPROOT_CONTROL_BASE_SIZE);
@@ -2070,6 +2117,12 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             const valtype& annex = SpanPopBack(stack);
             execdata.m_annex_hash = (HashWriter{} << annex).GetSHA256();
             execdata.m_annex_present = true;
+			// BIPXXX: verify annex
+			if (flags & SCRIPT_VERIFY_ANNEX) {
+				if (!VerifyAnnex(annex, execdata)) {
+					return set_error(serror, SCRIPT_ERR_ANNEX_WRONG_FORMAT);
+				}
+			}
         } else {
             execdata.m_annex_present = false;
         }
