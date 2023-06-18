@@ -2017,7 +2017,7 @@ uint256 ComputeTaprootMerkleRoot(Span<const unsigned char> control, const uint25
     return k;
 }
 
-bool VerifyAnnex(const std::vector<unsigned char>& annex_vec)
+bool VerifyAnnex(const std::vector<unsigned char>& annex_vec, AnnexValidationResult& result)
 {
 	CDataStream annex(MakeByteSpan(annex_vec), ANNEX_SER_TYPE, ANNEX_SER_VERSION);
 
@@ -2046,6 +2046,7 @@ bool VerifyAnnex(const std::vector<unsigned char>& annex_vec)
 		/* Consensus rule: the annex is not short - end of data
 		 * before reading is finished. */
 		if (annex.size() < nRecordLength)
+			result = AnnexValidationResult::FAILURE;
 			return false;
 
 		std::vector<unsigned char> vRecordValue;
@@ -2054,12 +2055,16 @@ bool VerifyAnnex(const std::vector<unsigned char>& annex_vec)
 
 		switch (nRecordType) {
 			/* Consensus rule : record value must make sense, per
-			 * the tag spec */
+			 * the tag spec. */
+			case ANNEX_RECORD_POLICY_RESERVED:
+				/* No consensus validation on unstructured data */
+				continue;
 			default:
-
+				result = AnnexValidationResult::UNKNOWN_RECORD;
 				return true;
 		}
 	}
+	result = AnnexValidationResult::SUCCESS;
 	return true;
 }
 
@@ -2119,7 +2124,9 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             execdata.m_annex_present = true;
 			// BIPXXX: verify annex
 			if (flags & SCRIPT_VERIFY_ANNEX) {
-				if (!VerifyAnnex(annex, execdata)) {
+				AnnexValidationResult result;
+				VerifyAnnex(annex, result);
+				if (result == AnnexValidationResult::FAILURE) {
 					return set_error(serror, SCRIPT_ERR_ANNEX_WRONG_FORMAT);
 				}
 			}
