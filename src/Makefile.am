@@ -628,6 +628,8 @@ libbitcoin_consensus_a_SOURCES = \
   script/script.h \
   script/script_error.cpp \
   script/script_error.h \
+  script/txhash.cpp \
+  script/txhash.h \
   serialize.h \
   span.h \
   tinyformat.h \
@@ -942,6 +944,7 @@ libbitcoinkernel_la_SOURCES = \
   script/script_error.cpp \
   script/sigcache.cpp \
   script/standard.cpp \
+  script/txhash.cpp \
   shutdown.cpp \
   signet.cpp \
   support/cleanse.cpp \
