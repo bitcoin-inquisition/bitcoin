@@ -73,6 +73,7 @@ enum class TxoutType {
     WITNESS_V0_KEYHASH,
     WITNESS_V1_TAPROOT,
     TX_BARE_DEFAULT_CHECK_TEMPLATE_VERIFY_HASH,
+    BARE_CHECK_TXHASH_VERIFY,
     WITNESS_UNKNOWN, //!< Only for Witness versions not already defined above
 };
 

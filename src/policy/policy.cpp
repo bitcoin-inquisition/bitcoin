@@ -223,6 +223,11 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
             // pre-activation disallowing enforced via discouraged logic in the
             // interpreter.
             if (tx.vin[i].scriptSig.size() != 0) return false;
+        } else if (whichType == TxoutType::BARE_CHECK_TXHASH_VERIFY) {
+            // after activation, only allow bare with no scriptsig.
+            // pre-activation disallowing enforced via discouraged logic in the
+            // interpreter.
+            if (tx.vin[i].scriptSig.size() != 0) return false;
         }
     }
 

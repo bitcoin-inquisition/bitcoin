@@ -205,6 +205,11 @@ IsMineResult IsMineInner(const LegacyScriptPubKeyMan& keystore, const CScript& s
         ret = IsMineResult::NO;
         break;
     }
+    case TxoutType::BARE_CHECK_TXHASH_VERIFY:
+    {
+        ret = IsMineResult::NO;
+        break;
+    }
     } // no default case, so the compiler can warn about missing cases
 
     if (ret == IsMineResult::NO && keystore.HaveWatchOnly(scriptPubKey)) {
