@@ -7,6 +7,7 @@
 #include <primitives/transaction.h>
 #include <pubkey.h>
 #include <script/interpreter.h>
+#include <script/txhash.h>
 #include <serialize.h>
 #include <streams.h>
 #include <univalue.h>
@@ -159,8 +160,9 @@ void Test(const std::string& str)
         tx.vin[idx].scriptSig = ScriptFromHex(test["success"]["scriptSig"].get_str());
         tx.vin[idx].scriptWitness = ScriptWitnessFromJSON(test["success"]["witness"]);
         PrecomputedTransactionData txdata;
+        TxHashCache txhash_cache;
         txdata.Init(tx, std::vector<CTxOut>(prevouts));
-        MutableTransactionSignatureChecker txcheck(&tx, idx, prevouts[idx].nValue, txdata, MissingDataBehavior::ASSERT_FAIL);
+        MutableTransactionSignatureChecker txcheck(&tx, idx, prevouts[idx].nValue, txdata, &txhash_cache, MissingDataBehavior::ASSERT_FAIL);
         for (const auto flags : ALL_FLAGS) {
             // "final": true tests are valid for all flags. Others are only valid with flags that are
             // a subset of test_flags.
@@ -174,8 +176,9 @@ void Test(const std::string& str)
         tx.vin[idx].scriptSig = ScriptFromHex(test["failure"]["scriptSig"].get_str());
         tx.vin[idx].scriptWitness = ScriptWitnessFromJSON(test["failure"]["witness"]);
         PrecomputedTransactionData txdata;
+        TxHashCache txhash_cache;
         txdata.Init(tx, std::vector<CTxOut>(prevouts));
-        MutableTransactionSignatureChecker txcheck(&tx, idx, prevouts[idx].nValue, txdata, MissingDataBehavior::ASSERT_FAIL);
+        MutableTransactionSignatureChecker txcheck(&tx, idx, prevouts[idx].nValue, txdata, &txhash_cache, MissingDataBehavior::ASSERT_FAIL);
         for (const auto flags : ALL_FLAGS) {
             // If a test is supposed to fail with test_flags, it should also fail with any superset thereof.
             if ((flags & test_flags) == test_flags) {
