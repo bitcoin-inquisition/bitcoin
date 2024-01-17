@@ -1141,7 +1141,7 @@ def spenders_taproot_active():
     hashtype = lambda _: random.choice(VALID_SIGHASHES_TAPROOT)
     for opval in range(76, 0x100):
         opcode = CScriptOp(opval)
-        if not is_op_success(opcode):
+        if not is_op_success(opcode, LEAF_VERSION_TAPSCRIPT):
             continue
         scripts = [
             ("bare_success", CScript([opcode])),
@@ -1172,7 +1172,7 @@ def spenders_taproot_active():
     # Non-OP_SUCCESSx (verify that those aren't accidentally treated as OP_SUCCESSx)
     for opval in range(0, 0x100):
         opcode = CScriptOp(opval)
-        if is_op_success(opcode):
+        if is_op_success(opcode, LEAF_VERSION_TAPSCRIPT):
             continue
         scripts = [
             ("normal", CScript([OP_RETURN, opcode] + [OP_NOP] * 75)),
