@@ -105,17 +105,18 @@ public:
     }
 };
 
-class SignatureWeightChecker : public DeferringSignatureChecker
+template <class T>
+class SignatureWeightChecker : public DeferringSignatureChecker<T>
 {
 private:
     SignatureWeights& m_weights;
 
 public:
-    SignatureWeightChecker(SignatureWeights& weights, const BaseSignatureChecker& checker) : DeferringSignatureChecker(checker), m_weights(weights) {}
+    SignatureWeightChecker(SignatureWeights& weights, const GenericTransactionSignatureChecker<T>& checker) : DeferringSignatureChecker<T>(checker), m_weights(weights) {}
 
     bool CheckECDSASignature(const std::vector<unsigned char>& sig, const std::vector<unsigned char>& pubkey, const CScript& script, SigVersion sigversion) const override
     {
-        if (m_checker.CheckECDSASignature(sig, pubkey, script, sigversion)) {
+        if (this->m_checker.CheckECDSASignature(sig, pubkey, script, sigversion)) {
             m_weights.AddSigWeight(sig.size(), sigversion);
             return true;
         }

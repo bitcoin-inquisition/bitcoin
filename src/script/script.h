@@ -225,6 +225,8 @@ enum opcodetype
     OP_LE64TOSCRIPTNUM = 0xe1,
     OP_LE32TOLE64 = 0xe2,
 
+    OP_INOUT_AMOUNT = 0xe3,
+
     OP_INVALIDOPCODE = 0xff,
 };
 

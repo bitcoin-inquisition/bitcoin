@@ -1387,6 +1387,21 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                 }
                 break;
 
+                case OP_INOUT_AMOUNT:
+                {
+                    // Opcodes only available post tapscript_64bit
+                    if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0 || sigversion == SigVersion::TAPROOT || sigversion == SigVersion::TAPSCRIPT) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+
+                    unsigned int nIn = checker.GetNIn();
+                    int64_t fundingAmount = checker.GetTransactionData().m_spent_outputs[nIn].nValue;
+                    int64_t outAmount = checker.GetTransactionData().outputs[nIn].nValue;
+
+                    push8_le(stack, fundingAmount);
+                    push8_le(stack, outAmount);
+
+                }
+                break;
+
                 default:
                     return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
             }
@@ -1572,6 +1587,9 @@ template <class T>
 void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent_outputs, bool force)
 {
     assert(!m_spent_outputs_ready);
+
+    inputs = txTo.vin;
+    outputs = txTo.vout;
 
     m_spent_outputs = std::move(spent_outputs);
     if (!m_spent_outputs.empty()) {

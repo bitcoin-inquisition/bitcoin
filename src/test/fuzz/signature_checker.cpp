@@ -45,7 +45,12 @@ public:
         return m_fuzzed_data_provider.ConsumeBool();
     }
 
+    PrecomputedTransactionData GetTransactionData() const override {
+        return PrecomputedTransactionData();
+    }
+
     virtual ~FuzzedSignatureChecker() = default;
+
 };
 } // namespace
 

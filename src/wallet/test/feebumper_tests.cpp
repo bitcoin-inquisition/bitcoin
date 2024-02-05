@@ -32,7 +32,7 @@ static void CheckMaxWeightComputation(const std::string& script_str, const std::
 
     int64_t weight = GetTransactionInputWeight(input);
     SignatureWeights weights;
-    SignatureWeightChecker size_checker(weights, DUMMY_CHECKER);
+    SignatureWeightChecker size_checker(weights, DUMMY_GENERIC_CHECKER);
     bool script_ok = VerifyScript(input.scriptSig, prevout_script, &input.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, size_checker);
     BOOST_CHECK(script_ok);
     weight += weights.GetWeightDiffToMax();

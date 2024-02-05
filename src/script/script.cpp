@@ -161,6 +161,8 @@ std::string GetOpName(opcodetype opcode)
     case OP_LE64TOSCRIPTNUM        : return "OP_LE64TOSCRIPTNUM";
     case OP_LE32TOLE64             : return "OP_LE32TOLE64";
 
+    case OP_INOUT_AMOUNT           : return "OP_INOUT_AMOUNT";
+
     case OP_INVALIDOPCODE          : return "OP_INVALIDOPCODE";
 
     default:
@@ -364,7 +366,7 @@ bool IsOpSuccess(const opcodetype& opcode, SigVersion sigversion)
         return opcode == 80 || opcode == 98 || (opcode >= 126 && opcode <= 129) ||
            (opcode >= 131 && opcode <= 134) || (opcode >= 137 && opcode <= 138) ||
            (opcode >= 141 && opcode <= 142) || (opcode >= 149 && opcode <= 153) ||
-           (opcode >= 187 && opcode <= 214) || (opcode >= 227 && opcode <= 254);
+           (opcode >= 187 && opcode <= 214) || (opcode >= 228 && opcode <= 254);
         break;
     case SigVersion::BASE:
     case SigVersion::WITNESS_V0:

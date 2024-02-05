@@ -286,6 +286,10 @@ public:
         // Delegate to Satisfier.
         return ctx.CheckOlder(sequence.GetInt64());
     }
+
+    PrecomputedTransactionData GetTransactionData() const override {
+        return PrecomputedTransactionData();
+    }
 };
 
 //! Public key to be used as internal key for dummy Taproot spends.

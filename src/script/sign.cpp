@@ -572,17 +572,18 @@ bool ProduceSignature(const SigningProvider& provider, const BaseSignatureCreato
 }
 
 namespace {
-class SignatureExtractorChecker final : public DeferringSignatureChecker
+template <class T>
+class SignatureExtractorChecker final : public DeferringSignatureChecker<T>
 {
 private:
     SignatureData& sigdata;
 
 public:
-    SignatureExtractorChecker(SignatureData& sigdata, BaseSignatureChecker& checker) : DeferringSignatureChecker(checker), sigdata(sigdata) {}
+    SignatureExtractorChecker(SignatureData& sigdata, GenericTransactionSignatureChecker<T>& checker) : DeferringSignatureChecker<T>(checker), sigdata(sigdata) {}
 
     bool CheckECDSASignature(const std::vector<unsigned char>& scriptSig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const override
     {
-        if (m_checker.CheckECDSASignature(scriptSig, vchPubKey, scriptCode, sigversion)) {
+        if (this->m_checker.CheckECDSASignature(scriptSig, vchPubKey, scriptCode, sigversion)) {
             CPubKey pubkey(vchPubKey);
             sigdata.signatures.emplace(pubkey.GetID(), SigPair(pubkey, scriptSig));
             return true;
@@ -723,10 +724,30 @@ public:
     bool CheckSchnorrSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror) const override { return sig.size() != 0; }
     bool CheckLockTime(const CScriptNum& nLockTime) const override { return true; }
     bool CheckSequence(const CScriptNum& nSequence) const override { return true; }
+    PrecomputedTransactionData GetTransactionData() const override {
+        return PrecomputedTransactionData();
+    }
+};
+
+template<class T>
+class DummyGenericTransactionSignatureChecker final : public GenericTransactionSignatureChecker<T>
+{
+public:
+    //DummyGenericTransactionSignatureChecker() = default;
+    bool CheckECDSASignature(const std::vector<unsigned char>& sig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const override { return sig.size() != 0; }
+    bool CheckSchnorrSignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror) const override { return sig.size() != 0; }
+    bool CheckLockTime(const CScriptNum& nLockTime) const override { return true; }
+    bool CheckSequence(const CScriptNum& nSequence) const override { return true; }
+    PrecomputedTransactionData GetTransactionData() const override {
+        return PrecomputedTransactionData();
+    }
 };
 }
 
+
 const BaseSignatureChecker& DUMMY_CHECKER = DummySignatureChecker();
+
+const GenericTransactionSignatureChecker<CTransaction>& DUMMY_GENERIC_CHECKER = DummyGenericTransactionSignatureChecker<CTransaction>();
 
 namespace {
 class DummySignatureCreator final : public BaseSignatureCreator {
