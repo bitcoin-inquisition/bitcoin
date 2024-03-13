@@ -76,7 +76,7 @@ static inline int64_t read_le8_signed(const unsigned char* ptr)
 
 static inline void push8_le(std::vector<valtype>& stack, uint64_t v)
 {
-    uint64_t v_le = htole64_internal(v);
+    uint64_t v_le = htole64(v);
     stack.emplace_back(reinterpret_cast<unsigned char*>(&v_le), reinterpret_cast<unsigned char*>(&v_le) + sizeof(v_le));
 }
 
