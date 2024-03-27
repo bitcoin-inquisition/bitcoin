@@ -159,9 +159,11 @@ enum : uint32_t {
     // Making ANYPREVOUT public key versions (in BIP 342 scripts) non-standard
     SCRIPT_VERIFY_DISCOURAGE_ANYPREVOUT = (1U << 25),
 
-    // Support OP_TXHASH and OP_CHECKTXHASHVERIFY.
-    //
+    // Support OP_TXHASH and OP_CHECKTXHASHVERIFY for standard template
     SCRIPT_VERIFY_TXHASH = (1U << 26),
+
+    // discourage OP_TXHASH and OP_CHECKTXHASHVERIFY
+    SCRIPT_VERIFY_DISCOURAGE_TXHASH = (1U << 27),
 
     // Constants to point to the highest flag in use. Add new flags above this line.
     //

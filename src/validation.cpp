@@ -1008,9 +1008,11 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     TxValidationState& state = ws.m_state;
 
     const bool ctv_active = DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman, Consensus::DEPLOYMENT_CHECKTEMPLATEVERIFY);
+    const bool txh_active = DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman, Consensus::DEPLOYMENT_TXHASH);
     const bool apo_active = DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman, Consensus::DEPLOYMENT_ANYPREVOUT);
     const unsigned int scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS
         | (ctv_active ? SCRIPT_VERIFY_NONE : SCRIPT_VERIFY_DISCOURAGE_CHECK_TEMPLATE_VERIFY_HASH)
+        | (txh_active ? SCRIPT_VERIFY_NONE : SCRIPT_VERIFY_DISCOURAGE_TXHASH)
         | (apo_active ? SCRIPT_VERIFY_NONE : SCRIPT_VERIFY_DISCOURAGE_ANYPREVOUT);
 
     // Check input scripts and signatures.
@@ -2018,6 +2020,11 @@ unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Chainstat
     // Enforce ANYPREVOUT (BIP118)
     if ((flags & SCRIPT_VERIFY_TAPROOT) && DeploymentActiveAt(block_index, chainman, Consensus::DEPLOYMENT_ANYPREVOUT)) {
         flags |= SCRIPT_VERIFY_ANYPREVOUT;
+    }
+
+    // Enforce TXHASH
+    if (DeploymentActiveAt(block_index, chainman, Consensus::DEPLOYMENT_TXHASH)) {
+        flags |= SCRIPT_VERIFY_TXHASH;
     }
 
     return flags;
