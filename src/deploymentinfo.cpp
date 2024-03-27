@@ -89,6 +89,7 @@ const std::map<std::string, uint32_t> g_verify_flag_names{
     FLAG_NAME(DISCOURAGE_CHECK_TEMPLATE_VERIFY_HASH)
     FLAG_NAME(ANYPREVOUT)
     FLAG_NAME(DISCOURAGE_ANYPREVOUT)
+    FLAG_NAME(TXHASH)
 };
 #undef FLAG_NAME
 

@@ -246,7 +246,7 @@ OP_NOP1 = CScriptOp(0xb0)
 OP_CHECKLOCKTIMEVERIFY = CScriptOp(0xb1)
 OP_CHECKSEQUENCEVERIFY = CScriptOp(0xb2)
 OP_CHECKTEMPLATEVERIFY = CScriptOp(0xb3)
-OP_NOP5 = CScriptOp(0xb4)
+OP_CHECKTXHASHVERIFY = CScriptOp(0xb3)
 OP_NOP6 = CScriptOp(0xb5)
 OP_NOP7 = CScriptOp(0xb6)
 OP_NOP8 = CScriptOp(0xb7)
@@ -255,6 +255,8 @@ OP_NOP10 = CScriptOp(0xb9)
 
 # BIP 342 opcodes (Tapscript)
 OP_CHECKSIGADD = CScriptOp(0xba)
+
+OP_TXHASH = CScriptOp(0xbd)
 
 OP_INVALIDOPCODE = CScriptOp(0xff)
 
@@ -364,13 +366,14 @@ OPCODE_NAMES.update({
     OP_CHECKLOCKTIMEVERIFY: 'OP_CHECKLOCKTIMEVERIFY',
     OP_CHECKSEQUENCEVERIFY: 'OP_CHECKSEQUENCEVERIFY',
     OP_CHECKTEMPLATEVERIFY : 'OP_CHECKTEMPLATEVERIFY',
-    OP_NOP5: 'OP_NOP5',
+    OP_CHECKTXHASHVERIFY: 'OP_CHECKTXHASHVERIFY',
     OP_NOP6: 'OP_NOP6',
     OP_NOP7: 'OP_NOP7',
     OP_NOP8: 'OP_NOP8',
     OP_NOP9: 'OP_NOP9',
     OP_NOP10: 'OP_NOP10',
     OP_CHECKSIGADD: 'OP_CHECKSIGADD',
+    OP_TXHASH: 'OP_TXHASH',
     OP_INVALIDOPCODE: 'OP_INVALIDOPCODE',
 })
 
@@ -935,4 +938,4 @@ def taproot_construct(pubkey, scripts=None, *, keyver=None, treat_internal_as_in
     return TaprootInfo(CScript([OP_1, tweaked]), pubkey, negated + 0, tweak, leaves, h, tweaked, keyver)
 
 def is_op_success(o):
-    return o == 0x50 or o == 0x62 or o == 0x89 or o == 0x8a or o == 0x8d or o == 0x8e or (o >= 0x7e and o <= 0x81) or (o >= 0x83 and o <= 0x86) or (o >= 0x95 and o <= 0x99) or (o >= 0xbb and o <= 0xfe)
+    return o == 0x50 or o == 0x62 or o == 0x89 or o == 0x8a or o == 0x8d or o == 0x8e or (o >= 0x7e and o <= 0x81) or (o >= 0x83 and o <= 0x86) or (o >= 0x95 and o <= 0x99) or o == 0xbb or o == 0xbc or (o >= 0xbe and o <= 0xfe)
