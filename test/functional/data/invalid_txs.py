@@ -76,6 +76,9 @@ class BadTxTemplate:
     # the mempool (i.e. does it violate policy but not consensus)?
     valid_in_block = False
 
+    # Do we need a signature for this tx
+    wants_signature = True
+
     def __init__(self, *, spend_tx=None, spend_block=None):
         self.spend_tx = spend_block.vtx[0] if spend_block else spend_tx
         self.spend_avail = sum(o.nValue for o in self.spend_tx.vout)
@@ -101,6 +104,7 @@ class OutputMissing(BadTxTemplate):
 class InputMissing(BadTxTemplate):
     reject_reason = "bad-txns-vin-empty"
     expect_disconnect = True
+    wants_signature = False
 
     # We use a blank transaction here to make sure
     # it is interpreted as a non-witness transaction.
@@ -118,7 +122,9 @@ class InputMissing(BadTxTemplate):
 class SizeExactly64(BadTxTemplate):
     reject_reason = "tx-size-small"
     expect_disconnect = False
-    valid_in_block = True
+    valid_in_block = False
+    wants_signature = False
+    block_reject_reason = "64-byte-transaction"
 
     def get_tx(self):
         tx = CTransaction()
@@ -133,6 +139,7 @@ class SizeSub64(BadTxTemplate):
     reject_reason = "tx-size-small"
     expect_disconnect = False
     valid_in_block = True
+    wants_signature = False
 
     def get_tx(self):
         tx = CTransaction()
