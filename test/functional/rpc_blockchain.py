@@ -261,6 +261,20 @@ class BlockchainTest(BitcoinTestFramework):
                 'height': 0,
                 'active': True,
             },
+            '64bytetx': {
+                'type': 'heretical',
+                'heretical': {
+                    'binana-id': 'BIN-2016-0000-001',
+                    'start_time': -1,
+                    'timeout': 0x7fffffffffffffff,  # testdummy does not have a timeout so is set to the max int64 value
+                    'period': 144,
+                    'status': 'active',
+                    'status_next': 'active',
+                    'since': 0,
+                },
+                'active': True,
+                'height': 0,
+            },
           }
         })
 

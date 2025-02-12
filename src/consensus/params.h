@@ -35,6 +35,7 @@ enum DeploymentPos : uint16_t {
     DEPLOYMENT_CHECKTEMPLATEVERIFY, // Deployment of CTV (BIP 119)
     DEPLOYMENT_ANYPREVOUT,
     DEPLOYMENT_OP_CAT,
+    DEPLOYMENT_64BYTETX,
     // NOTE: Also add new deployments to VersionBitsDeploymentInfo in deploymentinfo.cpp
     MAX_VERSION_BITS_DEPLOYMENTS
 };
