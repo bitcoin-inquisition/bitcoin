@@ -244,6 +244,10 @@ struct ScriptExecutionData
     bool m_tapleaf_hash_init = false;
     //! The tapleaf hash.
     uint256 m_tapleaf_hash;
+    //! The taproot internal key.
+    std::optional<XOnlyPubKey> m_internal_key = std::nullopt;
+    //! The merkle root of the taproot tree.
+    std::optional<uint256> m_taproot_merkle_root = std::nullopt;
 
     //! Whether m_codeseparator_pos is initialized.
     bool m_codeseparator_pos_init = false;
@@ -265,24 +269,45 @@ struct ScriptExecutionData
     //! The hash of the corresponding output
     std::optional<uint256> m_output_hash;
 
-    //! The taproot internal key. */
-    std::optional<XOnlyPubKey> m_internal_key = std::nullopt;
+    //! Whether m_ccv_amount is initialized.
+    bool m_ccv_amount_init = false;
+    //! Residual amount of the current input according to CHECKCONTRACTVERIFY semantics.
+    CAmount m_ccv_amount;
 };
 
 /** The state of the script interpreter that persists across inputs of a single transaction.
  *
  * As access happens across different worker threads, it is crucial that access to this struct
- * is properly synchronized. Code accessing its members must hold the m_mutex lock. */
+ * is properly synchronized. Code accessing its members must hold the m_mutex lock.
+ * Currently only used for OP_CHECKCONTRACTVERIFY. */
 struct TransactionExecutionData {
     const CTransaction* m_tx;
     Mutex m_mutex;
 
-    // members related to the validation state of this transaction
-    // that need to persist across inputs will be added here,
-    // protected by m_mutex.
+    // If an error occurs during the evaluation of a condition related to the access to this
+    // struct, it must be stored here.
+    // The caller _must_ check if this field has value immediately after acquiring the lock,
+    // and return the corresponding script error if it does.
+    // This makes sure that the checks are idempotent if repeated with the same instance
+    // of TransactionExecutionData. This is necessary because the checks might mutate the
+    // state of the struct, and the check might be repeated multiple times.
+    std::optional<ScriptError> m_error GUARDED_BY(m_mutex) = std::nullopt;
+
+    // For each output, the minimum amount of that output in order for the transaction
+    // to be considered valid. Accumulated during the evaluation of OP_CHECKCONTRACTVERIFY
+    // with the 'default' semantics.
+    std::vector<CAmount> m_ccv_output_min_amount GUARDED_BY(m_mutex);
+    // Set to true if this output has been checked with OP_CHECKCONTRACTVERIFY
+    // with the 'default' semantics.
+    std::vector<bool> m_ccv_output_checked_default GUARDED_BY(m_mutex);
+    // Set to true if this output has been checked with OP_CHECKCONTRACTVERIFY
+    // with the 'deduct' semantics.
+    std::vector<bool> m_ccv_output_checked_deduct GUARDED_BY(m_mutex);
 
     TransactionExecutionData(const CTransaction* tx)
-        : m_tx(tx)
+    : m_ccv_output_min_amount(tx ? tx->vout.size() : 0, 0),
+      m_ccv_output_checked_default(tx ? tx->vout.size() : 0, false),
+      m_ccv_output_checked_deduct(tx ? tx->vout.size() : 0, false)
     {
         assert(tx != nullptr); // Ensure the transaction pointer is valid
     }
@@ -385,6 +410,11 @@ public:
         return {};
     }
 
+    virtual bool CheckContract(int mode, int index, const std::vector<unsigned char>& pubkey, const std::vector<unsigned char>& data, const std::vector<unsigned char>& taptree, ScriptExecutionData& execdata, ScriptError* serror, TransactionExecutionData* tx_exec_data) const
+    {
+        return false;
+    }
+
     virtual ~BaseSignatureChecker() = default;
 };
 
@@ -424,6 +454,7 @@ public:
     bool CheckSequence(const CScriptNum& nSequence) const override;
     bool CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const override;
     uint256 GetTemplateHash(ScriptExecutionData& execdata) const override;
+    bool CheckContract(int mode, int index, const std::vector<unsigned char>& pubkey, const std::vector<unsigned char>& data, const std::vector<unsigned char>& taptree, ScriptExecutionData& ScriptExecutionData, ScriptError* serror, TransactionExecutionData* tx_exec_data) const override;
 };
 
 using TransactionSignatureChecker = GenericTransactionSignatureChecker<CTransaction>;
