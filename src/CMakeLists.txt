@@ -19,6 +19,7 @@ include(../cmake/crc32c.cmake)
 include(../cmake/leveldb.cmake)
 include(../cmake/minisketch.cmake)
 add_subdirectory(univalue)
+add_subdirectory(simplicity)
 #=============================
 # secp256k1 subtree
 #=============================
@@ -127,6 +128,7 @@ target_link_libraries(bitcoin_consensus
     core_interface
     bitcoin_crypto
     secp256k1
+    BitcoinSimplicity
 )
 add_dependencies(bitcoin_consensus generate_binana_info)
 
