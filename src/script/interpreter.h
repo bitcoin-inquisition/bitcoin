@@ -169,6 +169,7 @@ bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, script_ver
 
 // Forward declarations of Simplicity structures.
 struct bitcoinTransaction;
+struct rawBitcoinTapEnv;
 
 struct SimplicityTransactionDeleter
 {
@@ -352,6 +353,11 @@ public:
         return {};
     }
 
+    virtual bool CheckSimplicity(const std::vector<unsigned char>& witness, const std::vector<unsigned char>& program, const rawBitcoinTapEnv& simplicityRawTap, int64_t minCost, int64_t budget, ScriptError* serror) const
+    {
+        return false;
+    }
+
     virtual ~BaseSignatureChecker() = default;
 };
 
@@ -391,6 +397,7 @@ public:
     bool CheckSequence(const CScriptNum& nSequence) const override;
     bool CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const override;
     uint256 GetTemplateHash(ScriptExecutionData& execdata) const override;
+    bool CheckSimplicity(const std::vector<unsigned char>& program, const std::vector<unsigned char>& witness, const rawBitcoinTapEnv& simplicityRawTap, int64_t minCost, int64_t budget, ScriptError* serror) const override;
 };
 
 using TransactionSignatureChecker = GenericTransactionSignatureChecker<CTransaction>;
