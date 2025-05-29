@@ -13,6 +13,10 @@
 #include <script/script.h>
 #include <tinyformat.h>
 #include <uint256.h>
+extern "C" {
+#include <simplicity/bitcoin/env.h>
+#include <simplicity/errorCodes.h>
+}
 
 typedef std::vector<unsigned char> valtype;
 
@@ -1638,6 +1642,10 @@ template
 uint256 GetDefaultCheckTemplateVerifyHash(const CMutableTransaction& tx, const uint256& outputs_hash, const uint256& sequences_hash,
                                 const uint32_t input_index);
 
+void SimplicityTransactionDeleter::operator()(bitcoinTransaction* ptr) const {
+    simplicity_bitcoin_freeTransaction(ptr);
+}
+
 template <class T>
 void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent_outputs, bool force)
 {
@@ -1693,6 +1701,44 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
     if (uses_bip341_taproot && m_spent_outputs_ready) {
         m_spent_amounts_single_hash = GetSpentAmountsSHA256(m_spent_outputs);
         m_spent_scripts_single_hash = GetSpentScriptsSHA256(m_spent_outputs);
+
+        std::vector<rawBitcoinBuffer> simplicityRawAnnex(txTo.vin.size());
+        std::vector<rawBitcoinInput> simplicityRawInput(txTo.vin.size());
+        for (size_t i = 0; i < txTo.vin.size(); ++i) {
+            simplicityRawInput[i].prevTxid = txTo.vin[i].prevout.hash.ToUint256().data();
+            simplicityRawInput[i].prevIx = txTo.vin[i].prevout.n;
+            simplicityRawInput[i].sequence = txTo.vin[i].nSequence;
+            simplicityRawInput[i].txo.value = m_spent_outputs[i].nValue;
+            simplicityRawInput[i].txo.scriptPubKey.buf = m_spent_outputs[i].scriptPubKey.data();
+            simplicityRawInput[i].txo.scriptPubKey.len = m_spent_outputs[i].scriptPubKey.size();
+            simplicityRawInput[i].annex = nullptr;
+            std::span<const valtype> stack{txTo.vin[i].scriptWitness.stack};
+            if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
+                simplicityRawAnnex[i].buf = stack.back().data()+1;
+                simplicityRawAnnex[i].len = stack.back().size()-1;
+                simplicityRawInput[i].annex = &simplicityRawAnnex[i];
+            }
+        }
+
+        std::vector<rawBitcoinOutput> simplicityRawOutput(txTo.vout.size());
+        for (size_t i = 0; i < txTo.vout.size(); ++i) {
+            simplicityRawOutput[i].value = txTo.vout[i].nValue;
+            simplicityRawOutput[i].scriptPubKey.buf = txTo.vout[i].scriptPubKey.data();
+            simplicityRawOutput[i].scriptPubKey.len = txTo.vout[i].scriptPubKey.size();
+        }
+
+        rawBitcoinTransaction simplicityRawTx;
+        uint256 rawHash = txTo.GetHash().ToUint256();
+        simplicityRawTx.txid = rawHash.begin();
+        simplicityRawTx.input = simplicityRawInput.data();
+        simplicityRawTx.numInputs = simplicityRawInput.size();
+        simplicityRawTx.output = simplicityRawOutput.data();
+        simplicityRawTx.numOutputs = simplicityRawOutput.size();
+        simplicityRawTx.version = txTo.version;
+        simplicityRawTx.lockTime = txTo.nLockTime;
+
+        m_simplicity_tx_data = SimplicityTransactionUniquePtr(simplicity_bitcoin_mallocTransaction(&simplicityRawTx));
+
         m_bip341_taproot_ready = true;
     }
 }

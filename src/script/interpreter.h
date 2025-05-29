@@ -167,10 +167,19 @@ static constexpr int MAX_SCRIPT_VERIFY_FLAGS_BITS = std::bit_width(MAX_SCRIPT_VE
 
 bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, script_verify_flags flags, ScriptError* serror);
 
+// Forward declarations of Simplicity structures.
+struct bitcoinTransaction;
+
+struct SimplicityTransactionDeleter
+{
+    void operator()(bitcoinTransaction* ptr) const;
+};
+using SimplicityTransactionUniquePtr = std::unique_ptr<bitcoinTransaction, SimplicityTransactionDeleter>;
+
 struct PrecomputedTransactionData
 {
     // Order of fields is packed below (uint256 is 32 bytes, vector is 24 bytes
-    // (3 ptrs), ready flags (1 byte each).
+    // (3 ptrs), Simplicity tx data is 8 bytes (1 ptr), ready flags (1 byte each).
 
     // BIP341 precomputed data.
     // These are single-SHA256, see https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#cite_note-16.
@@ -188,6 +197,9 @@ struct PrecomputedTransactionData
 
     // BIP341 cached outputs.
     std::vector<CTxOut> m_spent_outputs;
+
+    // Simplicity transaction data.
+    SimplicityTransactionUniquePtr m_simplicity_tx_data;
 
     //! Whether the bip341 fields above are initialized.
     bool m_bip341_taproot_ready = false;
