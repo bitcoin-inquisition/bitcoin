@@ -2200,6 +2200,16 @@ bool GenericTransactionSignatureChecker<T>::CheckContract(int mode, int index, c
         return HandleMissingData(m_mdb);
     }
 
+    // Implement the sigops/witnesssize ratio test.
+    // Each tweak contributes equally.
+    assert(execdata.m_validation_weight_left_init);
+    int n_tweaks = (!taptree.empty()) + (!data.empty());
+    int64_t validation_weight = n_tweaks * VALIDATION_WEIGHT_PER_CCV_TWEAK;
+    execdata.m_validation_weight_left -= validation_weight;
+    if (execdata.m_validation_weight_left < 0) {
+        return set_error(serror, SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT);
+    }
+
     bool use_current_taptree = taptree.size() == 1 && taptree.data()[0] == 0x81;
     bool use_current_pubkey = pubkey.size() == 1 && pubkey.data()[0] == 0x81;
 
