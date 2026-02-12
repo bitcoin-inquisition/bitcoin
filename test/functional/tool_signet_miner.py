@@ -41,12 +41,8 @@ class SignetMinerTest(BitcoinTestFramework):
         self.skip_if_no_wallet()
         self.skip_if_no_bitcoin_util()
 
-    def run_test(self):
-        node = self.nodes[0]
-        # import private key needed for signing block
-        node.importprivkey(bytes_to_wif(CHALLENGE_PRIVATE_KEY))
-
-        # generate block with signet miner tool
+    def mine_block(self, node):
+        n_blocks = node.getblockcount()
         base_dir = self.config["environment"]["SRCDIR"]
         signet_miner_path = os.path.join(base_dir, "contrib", "signet", "miner")
         subprocess.run([
@@ -60,7 +56,14 @@ class SignetMinerTest(BitcoinTestFramework):
                 f'--set-block-time={int(time.time())}',
                 '--poolnum=99',
             ], check=True, stderr=subprocess.STDOUT)
-        assert_equal(node.getblockcount(), 1)
+        assert_equal(node.getblockcount(), n_blocks + 1)
+
+    def run_test(self):
+        node = self.nodes[0]
+        # import private key needed for signing block
+        node.importprivkey(bytes_to_wif(CHALLENGE_PRIVATE_KEY))
+        # generate block with signet miner tool
+        self.mine_block(node)
 
 
 if __name__ == "__main__":
