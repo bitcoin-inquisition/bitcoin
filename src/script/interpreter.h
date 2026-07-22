@@ -167,10 +167,20 @@ static constexpr int MAX_SCRIPT_VERIFY_FLAGS_BITS = std::bit_width(MAX_SCRIPT_VE
 
 bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, script_verify_flags flags, ScriptError* serror);
 
+// Forward declarations of Simplicity structures.
+struct bitcoinTransaction;
+struct rawBitcoinTapEnv;
+
+struct SimplicityTransactionDeleter
+{
+    void operator()(bitcoinTransaction* ptr) const;
+};
+using SimplicityTransactionUniquePtr = std::unique_ptr<bitcoinTransaction, SimplicityTransactionDeleter>;
+
 struct PrecomputedTransactionData
 {
     // Order of fields is packed below (uint256 is 32 bytes, vector is 24 bytes
-    // (3 ptrs), ready flags (1 byte each).
+    // (3 ptrs), Simplicity tx data is 8 bytes (1 ptr), ready flags (1 byte each).
 
     // BIP341 precomputed data.
     // These are single-SHA256, see https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#cite_note-16.
@@ -188,6 +198,9 @@ struct PrecomputedTransactionData
 
     // BIP341 cached outputs.
     std::vector<CTxOut> m_spent_outputs;
+
+    // Simplicity transaction data.
+    SimplicityTransactionUniquePtr m_simplicity_tx_data;
 
     //! Whether the bip341 fields above are initialized.
     bool m_bip341_taproot_ready = false;
@@ -274,6 +287,7 @@ static constexpr size_t WITNESS_V1_TAPROOT_SIZE = 32;
 
 static constexpr uint8_t TAPROOT_LEAF_MASK = 0xfe;
 static constexpr uint8_t TAPROOT_LEAF_TAPSCRIPT = 0xc0;
+static constexpr uint8_t TAPROOT_LEAF_TAPSIMPLICITY = 0xbe;
 static constexpr size_t TAPROOT_CONTROL_BASE_SIZE = 33;
 static constexpr size_t TAPROOT_CONTROL_NODE_SIZE = 32;
 static constexpr size_t TAPROOT_CONTROL_MAX_NODE_COUNT = 128;
@@ -340,6 +354,11 @@ public:
         return {};
     }
 
+    virtual bool CheckSimplicity(const std::vector<unsigned char>& witness, const std::vector<unsigned char>& program, const rawBitcoinTapEnv& simplicityRawTap, int64_t minCost, int64_t budget, ScriptError* serror) const
+    {
+        return false;
+    }
+
     virtual ~BaseSignatureChecker() = default;
 };
 
@@ -379,6 +398,7 @@ public:
     bool CheckSequence(const CScriptNum& nSequence) const override;
     bool CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const override;
     uint256 GetTemplateHash(ScriptExecutionData& execdata) const override;
+    bool CheckSimplicity(const std::vector<unsigned char>& program, const std::vector<unsigned char>& witness, const rawBitcoinTapEnv& simplicityRawTap, int64_t minCost, int64_t budget, ScriptError* serror) const override;
 };
 
 using TransactionSignatureChecker = GenericTransactionSignatureChecker<CTransaction>;

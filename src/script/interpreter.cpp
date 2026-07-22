@@ -13,6 +13,11 @@
 #include <script/script.h>
 #include <tinyformat.h>
 #include <uint256.h>
+extern "C" {
+#include <simplicity/bitcoin/env.h>
+#include <simplicity/bitcoin/exec.h>
+#include <simplicity/errorCodes.h>
+}
 
 typedef std::vector<unsigned char> valtype;
 
@@ -1638,6 +1643,10 @@ template
 uint256 GetDefaultCheckTemplateVerifyHash(const CMutableTransaction& tx, const uint256& outputs_hash, const uint256& sequences_hash,
                                 const uint32_t input_index);
 
+void SimplicityTransactionDeleter::operator()(bitcoinTransaction* ptr) const {
+    simplicity_bitcoin_freeTransaction(ptr);
+}
+
 template <class T>
 void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent_outputs, bool force)
 {
@@ -1693,6 +1702,44 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
     if (uses_bip341_taproot && m_spent_outputs_ready) {
         m_spent_amounts_single_hash = GetSpentAmountsSHA256(m_spent_outputs);
         m_spent_scripts_single_hash = GetSpentScriptsSHA256(m_spent_outputs);
+
+        std::vector<rawBitcoinBuffer> simplicityRawAnnex(txTo.vin.size());
+        std::vector<rawBitcoinInput> simplicityRawInput(txTo.vin.size());
+        for (size_t i = 0; i < txTo.vin.size(); ++i) {
+            simplicityRawInput[i].prevTxid = txTo.vin[i].prevout.hash.ToUint256().data();
+            simplicityRawInput[i].prevIx = txTo.vin[i].prevout.n;
+            simplicityRawInput[i].sequence = txTo.vin[i].nSequence;
+            simplicityRawInput[i].txo.value = m_spent_outputs[i].nValue;
+            simplicityRawInput[i].txo.scriptPubKey.buf = m_spent_outputs[i].scriptPubKey.data();
+            simplicityRawInput[i].txo.scriptPubKey.len = m_spent_outputs[i].scriptPubKey.size();
+            simplicityRawInput[i].annex = nullptr;
+            std::span<const valtype> stack{txTo.vin[i].scriptWitness.stack};
+            if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
+                simplicityRawAnnex[i].buf = stack.back().data()+1;
+                simplicityRawAnnex[i].len = stack.back().size()-1;
+                simplicityRawInput[i].annex = &simplicityRawAnnex[i];
+            }
+        }
+
+        std::vector<rawBitcoinOutput> simplicityRawOutput(txTo.vout.size());
+        for (size_t i = 0; i < txTo.vout.size(); ++i) {
+            simplicityRawOutput[i].value = txTo.vout[i].nValue;
+            simplicityRawOutput[i].scriptPubKey.buf = txTo.vout[i].scriptPubKey.data();
+            simplicityRawOutput[i].scriptPubKey.len = txTo.vout[i].scriptPubKey.size();
+        }
+
+        rawBitcoinTransaction simplicityRawTx;
+        uint256 rawHash = txTo.GetHash().ToUint256();
+        simplicityRawTx.txid = rawHash.begin();
+        simplicityRawTx.input = simplicityRawInput.data();
+        simplicityRawTx.numInputs = simplicityRawInput.size();
+        simplicityRawTx.output = simplicityRawOutput.data();
+        simplicityRawTx.numOutputs = simplicityRawOutput.size();
+        simplicityRawTx.version = txTo.version;
+        simplicityRawTx.lockTime = txTo.nLockTime;
+
+        m_simplicity_tx_data = SimplicityTransactionUniquePtr(simplicity_bitcoin_mallocTransaction(&simplicityRawTx));
+
         m_bip341_taproot_ready = true;
     }
 }
@@ -2135,6 +2182,52 @@ uint256 GenericTransactionSignatureChecker<T>::GetTemplateHash(ScriptExecutionDa
     return ss.GetSHA256();
 }
 
+template <class T>
+bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& program, const valtype& witness, const rawBitcoinTapEnv& simplicityRawTap, int64_t minCost, int64_t budget, ScriptError* serror) const
+{
+    simplicity_err error;
+    bitcoinTapEnv* simplicityTapEnv = simplicity_bitcoin_mallocTapEnv(&simplicityRawTap);
+
+    assert(txdata->m_simplicity_tx_data);
+    assert(simplicityTapEnv);
+    if (!simplicity_bitcoin_execSimplicity(&error, nullptr, txdata->m_simplicity_tx_data.get(), nIn, simplicityTapEnv, minCost, budget, nullptr, program.data(), program.size(), witness.data(), witness.size())) {
+        assert(!"simplicity_elements_execSimplicity internal error");
+    }
+    simplicity_bitcoin_freeTapEnv(simplicityTapEnv);
+    switch (error) {
+    case SIMPLICITY_NO_ERROR: return set_success(serror);
+    case SIMPLICITY_ERR_MALLOC:
+    case SIMPLICITY_ERR_NOT_YET_IMPLEMENTED:
+        assert(!"simplicity_elements_execSimplicity internal error");
+        break;
+    case SIMPLICITY_ERR_DATA_OUT_OF_RANGE: return set_error(serror, SCRIPT_ERR_SIMPLICITY_DATA_OUT_OF_RANGE);
+    case SIMPLICITY_ERR_DATA_OUT_OF_ORDER: return set_error(serror, SCRIPT_ERR_SIMPLICITY_DATA_OUT_OF_ORDER);
+    case SIMPLICITY_ERR_FAIL_CODE: return set_error(serror, SCRIPT_ERR_SIMPLICITY_FAIL_CODE);
+    case SIMPLICITY_ERR_RESERVED_CODE: return set_error(serror, SCRIPT_ERR_SIMPLICITY_RESERVED_CODE);
+    case SIMPLICITY_ERR_HIDDEN: return set_error(serror, SCRIPT_ERR_SIMPLICITY_HIDDEN);
+    case SIMPLICITY_ERR_BITSTREAM_EOF: return set_error(serror, SCRIPT_ERR_SIMPLICITY_BITSTREAM_EOF);
+    case SIMPLICITY_ERR_BITSTREAM_TRAILING_BYTES: return set_error(serror, SCRIPT_ERR_SIMPLICITY_BITSTREAM_TRAILING_BYTES);
+    case SIMPLICITY_ERR_BITSTREAM_ILLEGAL_PADDING: return set_error(serror, SCRIPT_ERR_SIMPLICITY_BITSTREAM_ILLEGAL_PADDING);
+    case SIMPLICITY_ERR_TYPE_INFERENCE_UNIFICATION: return set_error(serror, SCRIPT_ERR_SIMPLICITY_TYPE_INFERENCE_UNIFICATION);
+    case SIMPLICITY_ERR_TYPE_INFERENCE_OCCURS_CHECK: return set_error(serror, SCRIPT_ERR_SIMPLICITY_TYPE_INFERENCE_OCCURS_CHECK);
+    case SIMPLICITY_ERR_TYPE_INFERENCE_NOT_PROGRAM: return set_error(serror, SCRIPT_ERR_SIMPLICITY_TYPE_INFERENCE_NOT_PROGRAM);
+    case SIMPLICITY_ERR_WITNESS_EOF: return set_error(serror, SCRIPT_ERR_SIMPLICITY_WITNESS_EOF);
+    case SIMPLICITY_ERR_WITNESS_TRAILING_BYTES: return set_error(serror, SCRIPT_ERR_SIMPLICITY_WITNESS_TRAILING_BYTES);
+    case SIMPLICITY_ERR_WITNESS_ILLEGAL_PADDING: return set_error(serror, SCRIPT_ERR_SIMPLICITY_WITNESS_ILLEGAL_PADDING);
+    case SIMPLICITY_ERR_UNSHARED_SUBEXPRESSION: return set_error(serror, SCRIPT_ERR_SIMPLICITY_UNSHARED_SUBEXPRESSION);
+    case SIMPLICITY_ERR_CMR: return set_error(serror, SCRIPT_ERR_SIMPLICITY_CMR);
+    case SIMPLICITY_ERR_EXEC_BUDGET: return set_error(serror, SCRIPT_ERR_SIMPLICITY_EXEC_BUDGET);
+    case SIMPLICITY_ERR_EXEC_MEMORY: return set_error(serror, SCRIPT_ERR_SIMPLICITY_EXEC_MEMORY);
+    case SIMPLICITY_ERR_EXEC_JET: return set_error(serror, SCRIPT_ERR_SIMPLICITY_EXEC_JET);
+    case SIMPLICITY_ERR_EXEC_ASSERT: return set_error(serror, SCRIPT_ERR_SIMPLICITY_EXEC_ASSERT);
+    case SIMPLICITY_ERR_ANTIDOS: return set_error(serror, SCRIPT_ERR_SIMPLICITY_ANTIDOS);
+    case SIMPLICITY_ERR_HIDDEN_ROOT: return set_error(serror, SCRIPT_ERR_SIMPLICITY_HIDDEN_ROOT);
+    case SIMPLICITY_ERR_AMR: return set_error(serror, SCRIPT_ERR_SIMPLICITY_AMR);
+    case SIMPLICITY_ERR_OVERWEIGHT: return set_error(serror, SCRIPT_ERR_SIMPLICITY_OVERWEIGHT);
+    default: return set_error(serror, SCRIPT_ERR_UNKNOWN_ERROR);
+    }
+}
+
 // explicit instantiation
 template class GenericTransactionSignatureChecker<CTransaction>;
 template class GenericTransactionSignatureChecker<CMutableTransaction>;
@@ -2318,6 +2411,42 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
                 execdata.m_validation_weight_left = ::GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET;
                 execdata.m_validation_weight_left_init = true;
                 return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::TAPSCRIPT, checker, execdata, serror);
+            }
+            if ((flags & SCRIPT_VERIFY_SIMPLICITY) && (script.size() == 32) && (control[0] & TAPROOT_LEAF_MASK) == TAPROOT_LEAF_TAPSIMPLICITY) {
+                if (stack.size() < 2 || 3 < stack.size()) return set_error(serror, SCRIPT_ERR_SIMPLICITY_WRONG_LENGTH);
+                // Tapsimplicity (leaf version 0xbe)
+                const valtype& simplicity_program = SpanPopBack(stack);
+                const valtype& simplicity_witness = SpanPopBack(stack);
+                const int64_t budget = ::GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET;
+                int64_t minCost = 0;
+                rawBitcoinTapEnv simplicityRawTap;
+                simplicityRawTap.controlBlock = control.data();
+                simplicityRawTap.pathLen = (control.size() - TAPROOT_CONTROL_BASE_SIZE) / TAPROOT_CONTROL_NODE_SIZE;
+                simplicityRawTap.scriptCMR = script.data();
+                // If a padding stack item exists, we want to make sure it is minimal.
+                if (!stack.empty()) {
+                    const valtype& padding = SpanPopBack(stack);
+                    valtype zero_padding(padding.size());
+
+                    // There should be no more stack items.
+                    assert(stack.empty());
+
+                    // Padding must be all zeros.
+                    if (padding != zero_padding) {
+                        return set_error(serror, SCRIPT_ERR_SIMPLICITY_PADDING_NONZERO);
+                    }
+
+                    // Compute what the budget would have been without the padding.
+                    // budget includes the padding cost, so subtracting this stack item won't underflow.
+                    minCost = budget - ::GetSerializeSize(padding);
+
+                    if (!zero_padding.empty()) {
+                        // Set the minCost to what the budget would have been if the padding were one byte smaller.
+                        zero_padding.pop_back();
+                        minCost += ::GetSerializeSize(zero_padding);
+                    }
+                }
+                return checker.CheckSimplicity(simplicity_program, simplicity_witness, simplicityRawTap, minCost, budget, serror);
             }
             if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) {
                 return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION);
