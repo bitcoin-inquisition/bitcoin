@@ -1662,6 +1662,8 @@ struct KeyParser {
     FlatSigningProvider* m_out;
     //! Must not be nullptr if parsing from Script.
     const SigningProvider* m_in;
+    //! Multipath expanded Taproot internal key if parsing a Tapscript.
+    const std::vector<std::unique_ptr<PubkeyProvider>>* m_tr_internal_keys;
     //! List of multipath expanded keys contained in the Miniscript.
     mutable std::vector<std::vector<std::unique_ptr<PubkeyProvider>>> m_keys;
     //! Used to detect key parsing errors within a Miniscript.
@@ -1672,8 +1674,12 @@ struct KeyParser {
     uint32_t m_offset;
 
     KeyParser(FlatSigningProvider* out LIFETIMEBOUND, const SigningProvider* in LIFETIMEBOUND,
+              const std::vector<std::unique_ptr<PubkeyProvider>>* tr_internal_keys LIFETIMEBOUND,
               miniscript::MiniscriptContext ctx, uint32_t offset = 0)
-        : m_out(out), m_in(in), m_script_ctx(ctx), m_offset(offset) {}
+        : m_out(out), m_in(in), m_tr_internal_keys{tr_internal_keys}, m_script_ctx(ctx), m_offset(offset)
+    {
+        Assert(!(m_tr_internal_keys == nullptr && m_script_ctx == miniscript::MiniscriptContext::TAPSCRIPT));
+    }
 
     bool KeyCompare(const Key& a, const Key& b) const {
         return *m_keys.at(a).at(0) < *m_keys.at(b).at(0);
@@ -1744,6 +1750,18 @@ struct KeyParser {
         return {};
     }
 
+    Key GetInternalPK() const
+    {
+        Assert(m_tr_internal_keys);
+        std::vector<std::unique_ptr<PubkeyProvider>> internal_keys;
+        for (const auto& ik: *m_tr_internal_keys) {
+            internal_keys.emplace_back(Assert(ik)->Clone());
+        }
+        const auto key{m_keys.size()};
+        m_keys.emplace_back(std::move(internal_keys));
+        return key;
+    }
+
     miniscript::MiniscriptContext MsContext() const {
         return m_script_ctx;
     }
@@ -1751,7 +1769,7 @@ struct KeyParser {
 
 /** Parse a script in a particular context. */
 // NOLINTNEXTLINE(misc-no-recursion)
-std::vector<std::unique_ptr<DescriptorImpl>> ParseScript(uint32_t& key_exp_index, Span<const char>& sp, ParseScriptContext ctx, FlatSigningProvider& out, std::string& error)
+std::vector<std::unique_ptr<DescriptorImpl>> ParseScript(uint32_t& key_exp_index, Span<const char>& sp, ParseScriptContext ctx, FlatSigningProvider& out, std::string& error, std::vector<std::unique_ptr<PubkeyProvider>>* internal_pubkeys = nullptr)
 {
     using namespace script;
     Assume(ctx == ParseScriptContext::TOP || ctx == ParseScriptContext::P2SH || ctx == ParseScriptContext::P2WSH || ctx == ParseScriptContext::P2TR);
@@ -1973,7 +1991,7 @@ std::vector<std::unique_ptr<DescriptorImpl>> ParseScript(uint32_t& key_exp_index
                 }
                 // Process the actual script expression.
                 auto sarg = Expr(expr);
-                subscripts.emplace_back(ParseScript(key_exp_index, sarg, ParseScriptContext::P2TR, out, error));
+                subscripts.emplace_back(ParseScript(key_exp_index, sarg, ParseScriptContext::P2TR, out, error, &internal_keys));
                 if (subscripts.back().empty()) return {};
                 max_providers_len = std::max(max_providers_len, subscripts.back().size());
                 depths.push_back(branches.size());
@@ -2076,8 +2094,9 @@ std::vector<std::unique_ptr<DescriptorImpl>> ParseScript(uint32_t& key_exp_index
     }
     // Process miniscript expressions.
     {
-        const auto script_ctx{ctx == ParseScriptContext::P2WSH ? miniscript::MiniscriptContext::P2WSH : miniscript::MiniscriptContext::TAPSCRIPT};
-        KeyParser parser(/*out = */&out, /* in = */nullptr, /* ctx = */script_ctx, key_exp_index);
+        const auto script_ctx{ctx == ParseScriptContext::P2TR ? miniscript::MiniscriptContext::TAPSCRIPT : miniscript::MiniscriptContext::P2WSH};
+        CHECK_NONFATAL(internal_pubkeys != nullptr || ctx != ParseScriptContext::P2TR);
+        KeyParser parser(/*out = */&out, /* in = */nullptr, internal_pubkeys, /* ctx = */script_ctx, key_exp_index);
         auto node = miniscript::FromString(std::string(expr.begin(), expr.end()), parser);
         if (parser.m_key_parsing_error != "") {
             error = std::move(parser.m_key_parsing_error);
@@ -2099,8 +2118,8 @@ std::vector<std::unique_ptr<DescriptorImpl>> ParseScript(uint32_t& key_exp_index
                     error += " is not sane";
                     if (!insane_node->IsNonMalleable()) {
                         error += ": malleable witnesses exist";
-                    } else if (insane_node == node.get() && !insane_node->NeedsSignature()) {
-                        error += ": witnesses without signature exist";
+                    } else if (insane_node == node.get() && !insane_node->CommitsToTx()) {
+                        error += ": witnesses that don't commit to spending transaction exist";
                     } else if (!insane_node->CheckTimeLocksMix()) {
                         error += ": contains mixes of timelocks expressed in blocks and seconds";
                     } else if (!insane_node->CheckDuplicateKey()) {
@@ -2113,16 +2132,17 @@ std::vector<std::unique_ptr<DescriptorImpl>> ParseScript(uint32_t& key_exp_index
                 }
                 return {};
             }
-            // A signature check is required for a miniscript to be sane. Therefore no sane miniscript
-            // may have an empty list of public keys.
-            CHECK_NONFATAL(!parser.m_keys.empty());
+            // Committing to the spending transaction is required for a Miniscript to be sane. However,
+            // since the introduction of 'th()' it is possible for it to be true while `parser.m_keys`
+            // is empty.
             key_exp_index += parser.m_keys.size();
             // Make sure all vecs are of the same length, or exactly length 1
             // For length 1 vectors, clone subdescs until vector is the same length
-            size_t num_multipath = std::max_element(parser.m_keys.begin(), parser.m_keys.end(),
+            auto max_elem{std::max_element(parser.m_keys.begin(), parser.m_keys.end(),
                     [](const std::vector<std::unique_ptr<PubkeyProvider>>& a, const std::vector<std::unique_ptr<PubkeyProvider>>& b) {
                         return a.size() < b.size();
-                    })->size();
+                    })};
+            const size_t num_multipath{!parser.m_keys.empty() ? max_elem->size() : 1};
 
             for (auto& vec : parser.m_keys) {
                 if (vec.size() == 1) {
@@ -2175,7 +2195,7 @@ std::unique_ptr<DescriptorImpl> InferMultiA(const CScript& script, ParseScriptCo
 }
 
 // NOLINTNEXTLINE(misc-no-recursion)
-std::unique_ptr<DescriptorImpl> InferScript(const CScript& script, ParseScriptContext ctx, const SigningProvider& provider)
+std::unique_ptr<DescriptorImpl> InferScript(const CScript& script, ParseScriptContext ctx, const SigningProvider& provider, const std::vector<std::unique_ptr<PubkeyProvider>>* internal_pubkeys = nullptr)
 {
     if (ctx == ParseScriptContext::P2TR && script.size() == 34 && script[0] == 32 && script[33] == OP_CHECKSIG) {
         XOnlyPubKey key{Span{script}.subspan(1, 32)};
@@ -2257,6 +2277,9 @@ std::unique_ptr<DescriptorImpl> InferScript(const CScript& script, ParseScriptCo
             // If found, convert it back to tree form.
             auto tree = InferTaprootTree(tap, pubkey);
             if (tree) {
+                std::vector<std::unique_ptr<PubkeyProvider>> internal_keys;
+                internal_keys.emplace_back(InferXOnlyPubkey(tap.internal_key, ParseScriptContext::P2TR, provider));
+                CHECK_NONFATAL(internal_keys.at(0));
                 // If that works, try to infer subdescriptors for all leaves.
                 bool ok = true;
                 std::vector<std::unique_ptr<DescriptorImpl>> subscripts; //!< list of script subexpressions
@@ -2264,7 +2287,7 @@ std::unique_ptr<DescriptorImpl> InferScript(const CScript& script, ParseScriptCo
                 for (const auto& [depth, script, leaf_ver] : *tree) {
                     std::unique_ptr<DescriptorImpl> subdesc;
                     if (leaf_ver == TAPROOT_LEAF_TAPSCRIPT) {
-                        subdesc = InferScript(CScript(script.begin(), script.end()), ParseScriptContext::P2TR, provider);
+                        subdesc = InferScript(CScript(script.begin(), script.end()), ParseScriptContext::P2TR, provider, &internal_keys);
                     }
                     if (!subdesc) {
                         ok = false;
@@ -2275,8 +2298,7 @@ std::unique_ptr<DescriptorImpl> InferScript(const CScript& script, ParseScriptCo
                     }
                 }
                 if (ok) {
-                    auto key = InferXOnlyPubkey(tap.internal_key, ParseScriptContext::P2TR, provider);
-                    return std::make_unique<TRDescriptor>(std::move(key), std::move(subscripts), std::move(depths));
+                    return std::make_unique<TRDescriptor>(std::move(internal_keys.at(0)), std::move(subscripts), std::move(depths));
                 }
             }
         }
@@ -2291,7 +2313,8 @@ std::unique_ptr<DescriptorImpl> InferScript(const CScript& script, ParseScriptCo
 
     if (ctx == ParseScriptContext::P2WSH || ctx == ParseScriptContext::P2TR) {
         const auto script_ctx{ctx == ParseScriptContext::P2WSH ? miniscript::MiniscriptContext::P2WSH : miniscript::MiniscriptContext::TAPSCRIPT};
-        KeyParser parser(/* out = */nullptr, /* in = */&provider, /* ctx = */script_ctx);
+        CHECK_NONFATAL(internal_pubkeys != nullptr || ctx == ParseScriptContext::P2WSH);
+        KeyParser parser(/* out = */nullptr, /* in = */&provider, /* tr_internal_keys = */internal_pubkeys, /* ctx = */script_ctx);
         auto node = miniscript::FromScript(script, parser);
         if (node && node->IsSane()) {
             std::vector<std::unique_ptr<PubkeyProvider>> keys;

@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <consensus/consensus.h>
@@ -101,6 +102,10 @@ namespace miniscript {
  *   - This generally requires 'm' for all subexpressions, and 'e' for all subexpressions
  *     which are dissatisfied when satisfying the parent.
  *
+ * An additional type property helps reasoning about "sanity":
+ * - "t" Transaction commitment:
+ *   - Satisfactions (if any) for this expression always commits to the spending transaction.
+ *
  * One type property is an implementation detail:
  * - "x" Expensive verify:
  *   - Expressions with this property have a script whose last opcode is not EQUAL, CHECKSIG, or CHECKMULTISIG.
@@ -179,6 +184,7 @@ inline consteval Type operator""_mst(const char* c, size_t l)
             *p == 'i' ? 1 << 16 : // after: contains time timelock   (cltv_time)
             *p == 'j' ? 1 << 17 : // after: contains height timelock   (cltv_height)
             *p == 'k' ? 1 << 18 : // does not contain a combination of height and time locks
+            *p == 't' ? 1 << 19 : // Transaction signed property
             (throw std::logic_error("Unknown character in _mst literal"), 0)
         );
     }
@@ -201,19 +207,23 @@ enum class Fragment {
     JUST_1,    //!< OP_1
     PK_K,      //!< [key]
     PK_H,      //!< OP_DUP OP_HASH160 [keyhash] OP_EQUALVERIFY
+    PK_I,      //!< OP_INTERNALKEY
     OLDER,     //!< [n] OP_CHECKSEQUENCEVERIFY
     AFTER,     //!< [n] OP_CHECKLOCKTIMEVERIFY
     SHA256,    //!< OP_SIZE 32 OP_EQUALVERIFY OP_SHA256 [hash] OP_EQUAL
     HASH256,   //!< OP_SIZE 32 OP_EQUALVERIFY OP_HASH256 [hash] OP_EQUAL
     RIPEMD160, //!< OP_SIZE 32 OP_EQUALVERIFY OP_RIPEMD160 [hash] OP_EQUAL
     HASH160,   //!< OP_SIZE 32 OP_EQUALVERIFY OP_HASH160 [hash] OP_EQUAL
+    TH,        //!< [hash] OP_TEMPLATEHASH OP_EQUAL
     WRAP_A,    //!< OP_TOALTSTACK [X] OP_FROMALTSTACK
     WRAP_S,    //!< OP_SWAP [X]
     WRAP_C,    //!< [X] OP_CHECKSIG
     WRAP_D,    //!< OP_DUP OP_IF [X] OP_ENDIF
     WRAP_V,    //!< [X] OP_VERIFY (or -VERIFY version of last opcode in X)
+    WRAP_R,    //!< [X] OP_TEMPLATEHASH OP_SWAP OP_CHECKSIGFROMSTACK
     WRAP_J,    //!< OP_SIZE OP_0NOTEQUAL OP_IF [X] OP_ENDIF
     WRAP_N,    //!< [X] OP_0NOTEQUAL
+    CMS,       //!< [X] <m> OP_SWAP OP_CHECKSIGFROMSTACK
     AND_V,     //!< [X] [Y]
     AND_B,     //!< [X] [Y] OP_BOOLAND
     OR_B,      //!< [X] [Y] OP_BOOLOR
@@ -235,6 +245,24 @@ enum class Availability {
     YES,
     MAYBE,
 };
+
+struct NoSig {};
+struct TxSig {};
+struct TxRebSig {};
+struct CustomSig {
+    std::span<const uint8_t> msg;
+};
+/** The type of message for a signature check. May be NoSig if no parent of a fragment comports a
+ * signature check, TxSig if the parent (or an ancestor) of a fragment is a regular transaction
+ * signature check (CHECKSIG and friends), TxRebSig if it is a rebindable signature check, and CustomSig
+ * if it is a signature check for an arbitrary message. */
+using SigMsgType = std::variant<NoSig, TxSig, TxRebSig, CustomSig>;
+
+constexpr bool CommitsTx(const SigMsgType& sig_type)
+{
+    return std::holds_alternative<miniscript::TxSig>(sig_type)
+        || std::holds_alternative<miniscript::TxRebSig>(sig_type);
+}
 
 enum class MiniscriptContext {
     P2WSH,
@@ -285,7 +313,7 @@ constexpr uint32_t MaxScriptSize(MiniscriptContext ms_ctx)
 Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Type>& sub_types, uint32_t k, size_t data_size, size_t n_subs, size_t n_keys, MiniscriptContext ms_ctx);
 
 //! Helper function for Node::CalcScriptLen.
-size_t ComputeScriptLen(Fragment fragment, Type sub0typ, size_t subsize, uint32_t k, size_t n_subs, size_t n_keys, MiniscriptContext ms_ctx);
+size_t ComputeScriptLen(Fragment fragment, Type sub0typ, size_t subsize, uint32_t k, size_t n_subs, size_t n_keys, MiniscriptContext ms_ctx, const std::vector<unsigned char>& data);
 
 //! A helper sanitizer/checker for the output of CalcType.
 Type SanitizeType(Type x);
@@ -298,6 +326,8 @@ struct InputStack {
      *  filled with dummy signatures/preimages usable for witness size estimation.
      */
     Availability available = Availability::YES;
+    //! Whether the spending transaction is fixed.
+    bool commits_tx = false;
     //! Whether this stack contains a digital signature.
     bool has_sig = false;
     //! Whether this stack is malleable (can be turned into an equally valid other stack by a third party).
@@ -315,6 +345,8 @@ struct InputStack {
     InputStack(std::vector<unsigned char> in) : size(in.size() + 1), stack(Vector(std::move(in))) {}
     //! Change availability
     InputStack& SetAvailable(Availability avail);
+    //! Mark this input stack as fixing the spending transaction.
+    InputStack& SetCommitsTx();
     //! Mark this input stack as having a signature.
     InputStack& SetWithSig();
     //! Mark this input stack as non-canonical (known to not be necessary in non-malleable satisfactions).
@@ -475,6 +507,7 @@ struct SatInfo {
     static constexpr SatInfo OP_EQUAL() noexcept { return {1, 1}; }
     static constexpr SatInfo OP_SIZE() noexcept { return {-1, 0}; }
     static constexpr SatInfo OP_CHECKSIG() noexcept { return {1, 1}; }
+    static constexpr SatInfo OP_CSFS() noexcept { return {2, 2}; }
     static constexpr SatInfo OP_0NOTEQUAL() noexcept { return {0, 0}; }
     static constexpr SatInfo OP_VERIFY() noexcept { return {1, 1}; }
 };
@@ -574,7 +607,7 @@ private:
         }
         static constexpr auto NONE_MST{""_mst};
         Type sub0type = subs.size() > 0 ? subs[0]->GetType() : NONE_MST;
-        return internal::ComputeScriptLen(fragment, sub0type, subsize, k, subs.size(), keys.size(), m_script_ctx);
+        return internal::ComputeScriptLen(fragment, sub0type, subsize, k, subs.size(), keys.size(), m_script_ctx, data);
     }
 
     /* Apply a recursive algorithm to a Miniscript tree, without actual recursive calls.
@@ -768,12 +801,17 @@ public:
             switch (node.fragment) {
                 case Fragment::PK_K: return BuildScript(ctx.ToPKBytes(node.keys[0]));
                 case Fragment::PK_H: return BuildScript(OP_DUP, OP_HASH160, ctx.ToPKHBytes(node.keys[0]), OP_EQUALVERIFY);
+                case Fragment::PK_I: {
+                    CHECK_NONFATAL(is_tapscript);
+                    return BuildScript(OP_INTERNALKEY);
+                }
                 case Fragment::OLDER: return BuildScript(node.k, OP_CHECKSEQUENCEVERIFY);
                 case Fragment::AFTER: return BuildScript(node.k, OP_CHECKLOCKTIMEVERIFY);
                 case Fragment::SHA256: return BuildScript(OP_SIZE, 32, OP_EQUALVERIFY, OP_SHA256, node.data, verify ? OP_EQUALVERIFY : OP_EQUAL);
                 case Fragment::RIPEMD160: return BuildScript(OP_SIZE, 32, OP_EQUALVERIFY, OP_RIPEMD160, node.data, verify ? OP_EQUALVERIFY : OP_EQUAL);
                 case Fragment::HASH256: return BuildScript(OP_SIZE, 32, OP_EQUALVERIFY, OP_HASH256, node.data, verify ? OP_EQUALVERIFY : OP_EQUAL);
                 case Fragment::HASH160: return BuildScript(OP_SIZE, 32, OP_EQUALVERIFY, OP_HASH160, node.data, verify ? OP_EQUALVERIFY : OP_EQUAL);
+                case Fragment::TH: return BuildScript(node.data, OP_TEMPLATEHASH, verify ? OP_EQUALVERIFY : OP_EQUAL);
                 case Fragment::WRAP_A: return BuildScript(OP_TOALTSTACK, subs[0], OP_FROMALTSTACK);
                 case Fragment::WRAP_S: return BuildScript(OP_SWAP, subs[0]);
                 case Fragment::WRAP_C: return BuildScript(std::move(subs[0]), verify ? OP_CHECKSIGVERIFY : OP_CHECKSIG);
@@ -785,8 +823,16 @@ public:
                         return std::move(subs[0]);
                     }
                 }
+                case Fragment::WRAP_R: {
+                    CHECK_NONFATAL(is_tapscript);
+                    return BuildScript(std::move(subs[0]), OP_TEMPLATEHASH, OP_SWAP, OP_CHECKSIGFROMSTACK);
+                }
                 case Fragment::WRAP_J: return BuildScript(OP_SIZE, OP_0NOTEQUAL, OP_IF, subs[0], OP_ENDIF);
                 case Fragment::WRAP_N: return BuildScript(std::move(subs[0]), OP_0NOTEQUAL);
+                case Fragment::CMS: {
+                    CHECK_NONFATAL(is_tapscript);
+                    return BuildScript(std::move(subs[0]), node.data, OP_SWAP, OP_CHECKSIGFROMSTACK);
+                }
                 case Fragment::JUST_1: return BuildScript(OP_1);
                 case Fragment::JUST_0: return BuildScript(OP_0);
                 case Fragment::AND_V: return BuildScript(std::move(subs[0]), subs[1]);
@@ -834,7 +880,7 @@ public:
             return (node.fragment == Fragment::WRAP_A || node.fragment == Fragment::WRAP_S ||
                     node.fragment == Fragment::WRAP_D || node.fragment == Fragment::WRAP_V ||
                     node.fragment == Fragment::WRAP_J || node.fragment == Fragment::WRAP_N ||
-                    node.fragment == Fragment::WRAP_C ||
+                    node.fragment == Fragment::WRAP_C || node.fragment == Fragment::WRAP_R ||
                     (node.fragment == Fragment::AND_V && node.subs[1]->fragment == Fragment::JUST_1) ||
                     (node.fragment == Fragment::OR_I && node.subs[0]->fragment == Fragment::JUST_0) ||
                     (node.fragment == Fragment::OR_I && node.subs[1]->fragment == Fragment::JUST_0));
@@ -861,11 +907,19 @@ public:
                         if (!key_str) return {};
                         return std::move(ret) + "pkh(" + std::move(*key_str) + ")";
                     }
+                    if (node.subs[0]->fragment == Fragment::PK_I) {
+                        // pki() is syntactic sugar for c:pk_i()
+                        return std::move(ret) + "pki()";
+                    }
                     return "c" + std::move(subs[0]);
                 case Fragment::WRAP_D: return "d" + std::move(subs[0]);
                 case Fragment::WRAP_V: return "v" + std::move(subs[0]);
                 case Fragment::WRAP_J: return "j" + std::move(subs[0]);
                 case Fragment::WRAP_N: return "n" + std::move(subs[0]);
+                case Fragment::WRAP_R: {
+                    CHECK_NONFATAL(is_tapscript);
+                    return "r" + std::move(subs[0]);
+                }
                 case Fragment::AND_V:
                     // t:X is syntactic sugar for and_v(X,1).
                     if (node.subs[1]->fragment == Fragment::JUST_1) return "t" + std::move(subs[0]);
@@ -887,14 +941,23 @@ public:
                     if (!key_str) return {};
                     return std::move(ret) + "pk_h(" + std::move(*key_str) + ")";
                 }
+                case Fragment::PK_I: {
+                    CHECK_NONFATAL(is_tapscript);
+                    return std::move(ret) + "pk_i()";
+                }
                 case Fragment::AFTER: return std::move(ret) + "after(" + util::ToString(node.k) + ")";
                 case Fragment::OLDER: return std::move(ret) + "older(" + util::ToString(node.k) + ")";
                 case Fragment::HASH256: return std::move(ret) + "hash256(" + HexStr(node.data) + ")";
                 case Fragment::HASH160: return std::move(ret) + "hash160(" + HexStr(node.data) + ")";
                 case Fragment::SHA256: return std::move(ret) + "sha256(" + HexStr(node.data) + ")";
+                case Fragment::TH: return std::move(ret) + "th(" + HexStr(node.data) + ")";
                 case Fragment::RIPEMD160: return std::move(ret) + "ripemd160(" + HexStr(node.data) + ")";
                 case Fragment::JUST_1: return std::move(ret) + "1";
                 case Fragment::JUST_0: return std::move(ret) + "0";
+                case Fragment::CMS: {
+                    CHECK_NONFATAL(is_tapscript);
+                    return std::move(ret) + "cms(" + std::move(subs[0]) + "," + HexStr(node.data) + ")";
+                }
                 case Fragment::AND_V: return std::move(ret) + "and_v(" + std::move(subs[0]) + "," + std::move(subs[1]) + ")";
                 case Fragment::AND_B: return std::move(ret) + "and_b(" + std::move(subs[0]) + "," + std::move(subs[1]) + ")";
                 case Fragment::OR_B: return std::move(ret) + "or_b(" + std::move(subs[0]) + "," + std::move(subs[1]) + ")";
@@ -947,12 +1010,14 @@ private:
             case Fragment::JUST_0: return {0, {}, 0};
             case Fragment::PK_K: return {0, 0, 0};
             case Fragment::PK_H: return {3, 0, 0};
+            case Fragment::PK_I: return {1, 0, 0};
             case Fragment::OLDER:
             case Fragment::AFTER: return {1, 0, {}};
             case Fragment::SHA256:
             case Fragment::RIPEMD160:
             case Fragment::HASH256:
             case Fragment::HASH160: return {4, 0, {}};
+            case Fragment::TH: return {2, 0, {}};
             case Fragment::AND_V: return {subs[0]->ops.count + subs[1]->ops.count, subs[0]->ops.sat + subs[1]->ops.sat, {}};
             case Fragment::AND_B: {
                 const auto count{1 + subs[0]->ops.count + subs[1]->ops.count};
@@ -996,8 +1061,10 @@ private:
             case Fragment::WRAP_N: return {1 + subs[0]->ops.count, subs[0]->ops.sat, subs[0]->ops.dsat};
             case Fragment::WRAP_A: return {2 + subs[0]->ops.count, subs[0]->ops.sat, subs[0]->ops.dsat};
             case Fragment::WRAP_D: return {3 + subs[0]->ops.count, subs[0]->ops.sat, 0};
+            case Fragment::WRAP_R: return {3 + subs[0]->ops.count, subs[0]->ops.sat, subs[0]->ops.dsat};
             case Fragment::WRAP_J: return {4 + subs[0]->ops.count, subs[0]->ops.sat, 0};
             case Fragment::WRAP_V: return {subs[0]->ops.count + (subs[0]->GetType() << "x"_mst), subs[0]->ops.sat, {}};
+            case Fragment::CMS: return {2 + subs[0]->ops.count, subs[0]->ops.sat, subs[0]->ops.dsat};
             case Fragment::THRESH: {
                 uint32_t count = 0;
                 auto sats = Vector(internal::MaxInt<uint32_t>(0));
@@ -1024,6 +1091,7 @@ private:
             case Fragment::AFTER: return {SatInfo::Push() + SatInfo::Nop(), {}};
             case Fragment::PK_K: return {SatInfo::Push()};
             case Fragment::PK_H: return {SatInfo::OP_DUP() + SatInfo::Hash() + SatInfo::Push() + SatInfo::OP_EQUALVERIFY()};
+            case Fragment::PK_I: return {SatInfo::Push()};
             case Fragment::SHA256:
             case Fragment::RIPEMD160:
             case Fragment::HASH256:
@@ -1031,6 +1099,8 @@ private:
                 SatInfo::OP_SIZE() + SatInfo::Push() + SatInfo::OP_EQUALVERIFY() + SatInfo::Hash() + SatInfo::Push() + SatInfo::OP_EQUAL(),
                 {}
             };
+            // Push the provided hash, push the actual template hash, then op_equal
+            case Fragment::TH: return SatInfo::Push() + SatInfo::Push() + SatInfo::OP_EQUAL();
             case Fragment::ANDOR: {
                 const auto& x{subs[0]->ss};
                 const auto& y{subs[1]->ss};
@@ -1096,10 +1166,20 @@ private:
                 SatInfo::OP_DUP() + SatInfo::If() + subs[0]->ss.sat,
                 SatInfo::OP_DUP() + SatInfo::If()
             };
+            case Fragment::WRAP_R: return {
+                // Get the key on the stack, then push the template hash, then CSFS
+                subs[0]->ss.sat + SatInfo::Push() + SatInfo::OP_CSFS(),
+                subs[0]->ss.dsat + SatInfo::Push() + SatInfo::OP_CSFS(),
+            };
             case Fragment::WRAP_V: return {subs[0]->ss.sat + SatInfo::OP_VERIFY(), {}};
             case Fragment::WRAP_J: return {
                 SatInfo::OP_SIZE() + SatInfo::OP_0NOTEQUAL() + SatInfo::If() + subs[0]->ss.sat,
                 SatInfo::OP_SIZE() + SatInfo::OP_0NOTEQUAL() + SatInfo::If()
+            };
+            case Fragment::CMS: return {
+                // message + CSFS
+                subs[0]->ss.sat + SatInfo::Push() + SatInfo::OP_CSFS(),
+                subs[0]->ss.dsat + SatInfo::Push() + SatInfo::OP_CSFS(),
             };
             case Fragment::THRESH: {
                 // sats[j] is the SatInfo corresponding to all traces reaching j satisfactions.
@@ -1131,6 +1211,8 @@ private:
     }
 
     internal::WitnessSize CalcWitnessSize() const {
+        // NOTE: this is a 1-byte overestimation for 'cms()' / 'r:' fragments since CSFS signatures
+        // must always be 64-byte long.
         const uint32_t sig_size = IsTapscript(m_script_ctx) ? 1 + 65 : 1 + 72;
         const uint32_t pubkey_size = IsTapscript(m_script_ctx) ? 1 + 32 : 1 + 33;
         switch (fragment) {
@@ -1140,10 +1222,12 @@ private:
             case Fragment::AFTER: return {0, {}};
             case Fragment::PK_K: return {sig_size, 1};
             case Fragment::PK_H: return {sig_size + pubkey_size, 1 + pubkey_size};
+            case Fragment::PK_I: return {sig_size, 1};
             case Fragment::SHA256:
             case Fragment::RIPEMD160:
             case Fragment::HASH256:
             case Fragment::HASH160: return {1 + 32, {}};
+            case Fragment::TH: return {0, 0};
             case Fragment::ANDOR: {
                 const auto sat{(subs[0]->ws.sat + subs[1]->ws.sat) | (subs[0]->ws.dsat + subs[2]->ws.sat)};
                 const auto dsat{subs[0]->ws.dsat + subs[2]->ws.dsat};
@@ -1164,10 +1248,15 @@ private:
             case Fragment::WRAP_A:
             case Fragment::WRAP_N:
             case Fragment::WRAP_S:
+            case Fragment::WRAP_R:
             case Fragment::WRAP_C: return subs[0]->ws;
             case Fragment::WRAP_D: return {1 + 1 + subs[0]->ws.sat, 1};
             case Fragment::WRAP_V: return {subs[0]->ws.sat, {}};
             case Fragment::WRAP_J: return {subs[0]->ws.sat, 1};
+            case Fragment::CMS: return {
+                subs[0]->ws.sat + sig_size,
+                subs[0]->ws.dsat + 1,
+            };
             case Fragment::THRESH: {
                 auto sats = Vector(internal::MaxInt<uint32_t>(0));
                 for (const auto& sub : subs) {
@@ -1187,21 +1276,44 @@ private:
     internal::InputResult ProduceInput(const Ctx& ctx) const {
         using namespace internal;
 
+        // Forward down the type of message an upper signature (if any) is for. This is because signature satisfaction
+        // happens at the key fragment level, which may be unaware of the message to provide a signature for.
+        auto downfn = [](SigMsgType sig_type, const Node& node, size_t child_index) -> SigMsgType {
+            if (node.fragment == Fragment::WRAP_C) {
+                return TxSig{};
+            } else if (node.fragment == Fragment::CMS) {
+                return CustomSig{.msg = std::span<const uint8_t>{node.data}};
+            } else if (node.fragment == Fragment::WRAP_R) {
+                return TxRebSig{};
+            }
+            return sig_type;
+        };
+
         // Internal function which is invoked for every tree node, constructing satisfaction/dissatisfactions
         // given those of its subnodes.
-        auto helper = [&ctx](const Node& node, Span<InputResult> subres) -> InputResult {
+        auto helper = [&ctx](SigMsgType sig_type, const Node& node, Span<InputResult> subres) -> InputResult {
             switch (node.fragment) {
-                case Fragment::PK_K: {
+                case Fragment::PK_K:
+                case Fragment::PK_I: {
                     std::vector<unsigned char> sig;
-                    Availability avail = ctx.Sign(node.keys[0], sig);
-                    return {ZERO, InputStack(std::move(sig)).SetWithSig().SetAvailable(avail)};
+                    Availability avail = ctx.Sign(node.keys[0], sig_type, sig);
+                    auto sat_stack{InputStack(std::move(sig)).SetWithSig().SetAvailable(avail)};
+                    if (CommitsTx(sig_type)) {
+                        sat_stack.SetCommitsTx();
+                    }
+                    return {ZERO, std::move(sat_stack)};
                 }
                 case Fragment::PK_H: {
                     std::vector<unsigned char> key = ctx.ToPKBytes(node.keys[0]), sig;
-                    Availability avail = ctx.Sign(node.keys[0], sig);
-                    return {ZERO + InputStack(key), (InputStack(std::move(sig)).SetWithSig() + InputStack(key)).SetAvailable(avail)};
+                    Availability avail = ctx.Sign(node.keys[0], sig_type, sig);
+                    auto sat_stack{(InputStack(std::move(sig)).SetWithSig() + InputStack(key)).SetAvailable(avail)};
+                    if (CommitsTx(sig_type)) {
+                        sat_stack.SetCommitsTx();
+                    }
+                    return {ZERO + InputStack(key), std::move(sat_stack)};
                 }
                 case Fragment::MULTI_A: {
+                    const SigMsgType sig_type{TxSig{}};
                     // sats[j] represents the best stack containing j valid signatures (out of the first i keys).
                     // In the loop below, these stacks are built up using a dynamic programming approach.
                     std::vector<InputStack> sats = Vector(EMPTY);
@@ -1209,9 +1321,9 @@ private:
                         // Get the signature for the i'th key in reverse order (the signature for the first key needs to
                         // be at the top of the stack, contrary to CHECKMULTISIG's satisfaction).
                         std::vector<unsigned char> sig;
-                        Availability avail = ctx.Sign(node.keys[node.keys.size() - 1 - i], sig);
+                        Availability avail = ctx.Sign(node.keys[node.keys.size() - 1 - i], sig_type, sig);
                         // Compute signature stack for just this key.
-                        auto sat = InputStack(std::move(sig)).SetWithSig().SetAvailable(avail);
+                        auto sat = InputStack(std::move(sig)).SetCommitsTx().SetWithSig().SetAvailable(avail);
                         // Compute the next sats vector: next_sats[0] is a copy of sats[0] (no signatures). All further
                         // next_sats[j] are equal to either the existing sats[j] + ZERO, or sats[j-1] plus a signature
                         // for the current (i'th) key. The very last element needs all signatures filled.
@@ -1230,15 +1342,16 @@ private:
                     return {std::move(nsat), std::move(sats[node.k])};
                 }
                 case Fragment::MULTI: {
+                    const SigMsgType sig_type{TxSig{}};
                     // sats[j] represents the best stack containing j valid signatures (out of the first i keys).
                     // In the loop below, these stacks are built up using a dynamic programming approach.
                     // sats[0] starts off being {0}, due to the CHECKMULTISIG bug that pops off one element too many.
                     std::vector<InputStack> sats = Vector(ZERO);
                     for (size_t i = 0; i < node.keys.size(); ++i) {
                         std::vector<unsigned char> sig;
-                        Availability avail = ctx.Sign(node.keys[i], sig);
+                        Availability avail = ctx.Sign(node.keys[i], sig_type, sig);
                         // Compute signature stack for just the i'th key.
-                        auto sat = InputStack(std::move(sig)).SetWithSig().SetAvailable(avail);
+                        auto sat = InputStack(std::move(sig)).SetCommitsTx().SetWithSig().SetAvailable(avail);
                         // Compute the next sats vector: next_sats[0] is a copy of sats[0] (no signatures). All further
                         // next_sats[j] are equal to either the existing sats[j], or sats[j-1] plus a signature for the
                         // current (i'th) key. The very last element needs all signatures filled.
@@ -1316,6 +1429,13 @@ private:
                     Availability avail = ctx.SatHASH160(node.data, preimage);
                     return {ZERO32, InputStack(std::move(preimage)).SetAvailable(avail)};
                 }
+                case Fragment::TH: {
+                    if (ctx.CheckTemplateHash(node.data)) {
+                        return {INVALID, InputStack{}.SetCommitsTx()};
+                    } else {
+                        return {EMPTY, INVALID};
+                    }
+                }
                 case Fragment::AND_V: {
                     auto& x = subres[0], &y = subres[1];
                     // As the dissatisfaction here only consist of a single option, it doesn't
@@ -1356,10 +1476,12 @@ private:
                     auto& x = subres[0], &y = subres[1], &z = subres[2];
                     return {(y.nsat + x.sat).SetNonCanon() | (z.nsat + x.nsat), (y.sat + x.sat) | (z.sat + x.nsat)};
                 }
+                case Fragment::CMS:
                 case Fragment::WRAP_A:
                 case Fragment::WRAP_S:
                 case Fragment::WRAP_C:
                 case Fragment::WRAP_N:
+                case Fragment::WRAP_R:
                     return std::move(subres[0]);
                 case Fragment::WRAP_D: {
                     auto &x = subres[0];
@@ -1385,8 +1507,8 @@ private:
             return {INVALID, INVALID};
         };
 
-        auto tester = [&helper](const Node& node, Span<InputResult> subres) -> InputResult {
-            auto ret = helper(node, subres);
+        auto tester = [&helper](SigMsgType sig_type, const Node& node, Span<InputResult> subres) -> InputResult {
+            auto ret = helper(sig_type, node, subres);
 
             // Do a consistency check between the satisfaction code and the type checker
             // (the actual satisfaction code in ProduceInputHelper does not use GetType)
@@ -1415,6 +1537,9 @@ private:
             if (node.GetType() << "f"_mst && ret.nsat.available != Availability::NO) assert(ret.nsat.has_sig);
             if (node.GetType() << "s"_mst && ret.sat.available != Availability::NO) assert(ret.sat.has_sig);
 
+            // For 't' nodes, satisfactions must commit to the spending transaction.
+            if (node.GetType() << "t"_mst && ret.sat.available != Availability::NO) assert(ret.sat.commits_tx);
+
             // For non-malleable 'e' nodes, a non-malleable dissatisfaction must exist.
             if (node.GetType() << "me"_mst) assert(ret.nsat.available != Availability::NO);
             if (node.GetType() << "me"_mst) assert(!ret.nsat.malleable);
@@ -1428,7 +1553,7 @@ private:
             return ret;
         };
 
-        return TreeEval<InputResult>(tester);
+        return TreeEval<InputResult>(SigMsgType{}, downfn, tester);
     }
 
 public:
@@ -1466,7 +1591,8 @@ public:
             }
 
             // Start building the set of keys involved in this node and children.
-            // Start by keys in this node directly.
+            // Start by keys in this node directly. Note this also takes pk_i() fragments
+            // into account since we store the internal key in node.keys for those.
             size_t keys_count = node.keys.size();
             keyset key_set{node.keys.begin(), node.keys.end(), Comp(ctx)};
             if (key_set.size() != keys_count) {
@@ -1582,6 +1708,7 @@ public:
                     return true;
                 case Fragment::PK_K:
                 case Fragment::PK_H:
+                case Fragment::PK_I:
                 case Fragment::MULTI:
                 case Fragment::MULTI_A:
                 case Fragment::AFTER:
@@ -1590,6 +1717,7 @@ public:
                 case Fragment::HASH160:
                 case Fragment::SHA256:
                 case Fragment::RIPEMD160:
+                case Fragment::TH:
                     return bool{fn(node)};
                 case Fragment::ANDOR:
                     return (subs[0] && subs[1]) || subs[2];
@@ -1622,8 +1750,8 @@ public:
     //! Check whether this script can always be satisfied in a non-malleable way.
     bool IsNonMalleable() const { return GetType() << "m"_mst; }
 
-    //! Check whether this script always needs a signature.
-    bool NeedsSignature() const { return GetType() << "s"_mst; }
+    //! Check whether spending this script requires committing to the spending transaction.
+    bool CommitsToTx() const { return GetType() << "t"_mst; }
 
     //! Check whether there is no satisfaction path that contains both timelocks and heightlocks
     bool CheckTimeLocksMix() const { return GetType() << "k"_mst; }
@@ -1638,7 +1766,7 @@ public:
     bool IsSaneSubexpression() const { return ValidSatisfactions() && IsNonMalleable() && CheckTimeLocksMix() && CheckDuplicateKey(); }
 
     //! Check whether this node is safe as a script on its own.
-    bool IsSane() const { return IsValidTopLevel() && IsSaneSubexpression() && NeedsSignature(); }
+    bool IsSane() const { return IsValidTopLevel() && IsSaneSubexpression() && CommitsToTx(); }
 
     //! Produce a witness for this script, if possible and given the information available in the context.
     //! The non-malleable satisfaction is guaranteed to be valid if it exists, and ValidSatisfaction()
@@ -1647,7 +1775,7 @@ public:
     template<typename Ctx>
     Availability Satisfy(const Ctx& ctx, std::vector<std::vector<unsigned char>>& stack, bool nonmalleable = true) const {
         auto ret = ProduceInput(ctx);
-        if (nonmalleable && (ret.sat.malleable || !ret.sat.has_sig)) return Availability::NO;
+        if (nonmalleable && (ret.sat.malleable || !ret.sat.commits_tx)) return Availability::NO;
         stack = std::move(ret.sat.stack);
         return ret.sat.available;
     }
@@ -1702,6 +1830,8 @@ enum class ParseContext {
     ALT,
     /** CHECK wraps the top constructed node with c: */
     CHECK,
+    /** REBCHECK wraps the top constructed node with r: */
+    REBCHECK,
     /** DUP_IF wraps the top constructed node with d: */
     DUP_IF,
     /** VERIFY wraps the top constructed node with v: */
@@ -1731,6 +1861,9 @@ enum class ParseContext {
     OR_D,
     /** OR_I will construct an or_i node from the last two constructed nodes. */
     OR_I,
+
+    /** CMS will construct a cms(X, m) from the last constructed node and a given message. */
+    CMS,
 
     /** THRESH will read a wrapped expression, and then look for a COMMA. If
      * no comma follows, it will construct a thresh node from the appropriate
@@ -1770,6 +1903,9 @@ std::optional<std::pair<std::vector<unsigned char>, int>> ParseHexStrEnd(Span<co
     if (hash.size() != expected_size) return {};
     return {{std::move(hash), hash_size}};
 }
+
+/** Parse an arbitrarily-sized hex string ending at the end of the fragment's text representation. */
+std::optional<std::pair<std::vector<unsigned char>, int>> ParseArbHexStrEnd(Span<const char> in);
 
 /** BuildBack pops the last two elements off `constructed` and wraps them in the specified Fragment */
 template<typename Key>
@@ -1904,6 +2040,10 @@ inline NodeRef<Key> Parse(Span<const char> in, const Ctx& ctx)
                     script_size += 4;
                     constructed.push_back(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::JUST_0));
                     to_parse.emplace_back(ParseContext::OR_I, -1, -1);
+                } else if (in[j] == 'r') {
+                    if (!IsTapscript(ctx.MsContext())) return {};
+                    script_size += 3;
+                    to_parse.emplace_back(ParseContext::REBCHECK, -1, -1);
                 } else {
                     return {};
                 }
@@ -1932,6 +2072,12 @@ inline NodeRef<Key> Parse(Span<const char> in, const Ctx& ctx)
                 constructed.push_back(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::WRAP_C, Vector(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::PK_H, Vector(std::move(key))))));
                 in = in.subspan(key_size + 1);
                 script_size += 24;
+            } else if (Const("pki(", in)) {
+                if (!IsTapscript(ctx.MsContext())) return {};
+                const auto pubkey{ctx.GetInternalPK()};
+                constructed.push_back(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::WRAP_C, Vector(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::PK_I, Vector(std::move(pubkey))))));
+                in = in.subspan(1);
+                script_size += 1;
             } else if (Const("pk_k(", in)) {
                 auto res = ParseKeyEnd<Key>(in, ctx);
                 if (!res) return {};
@@ -1946,6 +2092,11 @@ inline NodeRef<Key> Parse(Span<const char> in, const Ctx& ctx)
                 constructed.push_back(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::PK_H, Vector(std::move(key))));
                 in = in.subspan(key_size + 1);
                 script_size += 23;
+            } else if (Const("pk_i(", in)) {
+                if (!IsTapscript(ctx.MsContext())) return {};
+                const auto pubkey{ctx.GetInternalPK()};
+                constructed.push_back(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::PK_I, Vector(std::move(pubkey))));
+                in = in.subspan(1);
             } else if (Const("sha256(", in)) {
                 auto res = ParseHexStrEnd(in, 32, ctx);
                 if (!res) return {};
@@ -1974,6 +2125,14 @@ inline NodeRef<Key> Parse(Span<const char> in, const Ctx& ctx)
                 constructed.push_back(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::HASH160, std::move(hash)));
                 in = in.subspan(hash_size + 1);
                 script_size += 26;
+            } else if (Const("th(", in)) {
+                if (!IsTapscript(ctx.MsContext())) return {};
+                auto res = ParseHexStrEnd(in, 32, ctx);
+                if (!res) return {};
+                auto& [thash, thash_size] = *res;
+                constructed.push_back(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::TH, std::move(thash)));
+                in = in.subspan(thash_size + 1);
+                script_size += 32 + 2;
             } else if (Const("after(", in)) {
                 int arg_size = FindNextChar(in, ')');
                 if (arg_size < 1) return {};
@@ -1990,6 +2149,12 @@ inline NodeRef<Key> Parse(Span<const char> in, const Ctx& ctx)
                 constructed.push_back(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::OLDER, *num));
                 in = in.subspan(arg_size + 1);
                 script_size += 1 + (*num > 16) + (*num > 0x7f) + (*num > 0x7fff) + (*num > 0x7fffff);
+            } else if (Const("cms(", in)) {
+                if (!IsTapscript(ctx.MsContext())) return {};
+                to_parse.emplace_back(ParseContext::CMS, -1, -1);
+                to_parse.emplace_back(ParseContext::COMMA, -1, -1);
+                to_parse.emplace_back(ParseContext::WRAPPED_EXPR, -1, -1);
+                // Script size is accounted for after parsing the message in ParseContext::CMS.
             } else if (Const("multi(", in)) {
                 if (!parse_multi_exp(in, /* is_multi_a = */false)) return {};
             } else if (Const("multi_a(", in)) {
@@ -2045,6 +2210,15 @@ inline NodeRef<Key> Parse(Span<const char> in, const Ctx& ctx)
             }
             break;
         }
+        case ParseContext::CMS: {
+            auto res = ParseArbHexStrEnd(in);
+            if (!res) return {};
+            auto& [msg, msg_size] = *res;
+            in = in.subspan(msg_size + 1);
+            script_size += BuildScript(msg).size() + 2;
+            constructed.back() = MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::CMS, Vector(std::move(constructed.back())), std::move(msg));
+            break;
+        }
         case ParseContext::ALT: {
             constructed.back() = MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::WRAP_A, Vector(std::move(constructed.back())));
             break;
@@ -2055,6 +2229,10 @@ inline NodeRef<Key> Parse(Span<const char> in, const Ctx& ctx)
         }
         case ParseContext::CHECK: {
             constructed.back() = MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::WRAP_C, Vector(std::move(constructed.back())));
+            break;
+        }
+        case ParseContext::REBCHECK: {
+            constructed.back() = MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::WRAP_R, Vector(std::move(constructed.back())));
             break;
         }
         case ParseContext::DUP_IF: {
@@ -2197,6 +2375,8 @@ enum class DecodeContext {
     ALT,
     /** CHECK wraps the top constructed node with c: */
     CHECK,
+    /** REBCHECK wraps the top constructed node with c: */
+    REBCHECK,
     /** DUP_IF wraps the top constructed node with d: */
     DUP_IF,
     /** VERIFY wraps the top constructed node with v: */
@@ -2205,6 +2385,10 @@ enum class DecodeContext {
     NON_ZERO,
     /** ZERO_NOTEQUAL wraps the top constructed node with n: */
     ZERO_NOTEQUAL,
+
+    /** Wraps the top of the constructed stack with a CHECKSIGFROMSTACK against
+     * a previously-read message. */
+    CHECK_MSG,
 
     /** MAYBE_AND_V will check if the next part of the script could be a valid
      * miniscript sub-expression, and if so it will push AND_V and SINGLE_BKV_EXPR
@@ -2246,12 +2430,26 @@ enum class DecodeContext {
     ENDIF_ELSE,
 };
 
+struct DecodeCtx {
+    DecodeContext ctx;
+    int64_t thresh_n;
+    int64_t thresh_k;
+    std::optional<std::vector<unsigned char>> cms_msg;
+
+    DecodeCtx(DecodeContext ctx_, int64_t n, int64_t k):
+        ctx{ctx_}, thresh_n{n}, thresh_k{k}, cms_msg{std::nullopt} {}
+    DecodeCtx(DecodeContext ctx_, std::vector<unsigned char> msg):
+        ctx{ctx_}, thresh_n{-1}, thresh_k{-1}, cms_msg{std::move(msg)} {}
+    DecodeCtx(DecodeContext ctx_):
+        ctx{ctx_}, thresh_n{-1}, thresh_k{-1}, cms_msg{std::nullopt} {}
+};
+
 //! Parse a miniscript from a bitcoin script
 template<typename Key, typename Ctx, typename I>
 inline NodeRef<Key> DecodeScript(I& in, I last, const Ctx& ctx)
 {
     // The two integers are used to hold state for thresh()
-    std::vector<std::tuple<DecodeContext, int64_t, int64_t>> to_parse;
+    std::vector<DecodeCtx> to_parse;
     std::vector<NodeRef<Key>> constructed;
 
     // This is the top level, so we assume the type is B
@@ -2263,7 +2461,7 @@ inline NodeRef<Key> DecodeScript(I& in, I last, const Ctx& ctx)
         if (!constructed.empty() && !constructed.back()->IsValid()) return {};
 
         // Get the current context we are decoding within
-        auto [cur_context, n, k] = to_parse.back();
+        auto [cur_context, n, k, cms_msg] = to_parse.back();
         to_parse.pop_back();
 
         switch(cur_context) {
@@ -2294,6 +2492,13 @@ inline NodeRef<Key> DecodeScript(I& in, I last, const Ctx& ctx)
                 if (!key) return {};
                 in += 5;
                 constructed.push_back(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::PK_H, Vector(std::move(*key))));
+                break;
+            }
+            if (in[0].first == OP_INTERNALKEY) {
+                if (!IsTapscript(ctx.MsContext())) return {};
+                const auto pubkey{ctx.GetInternalPK()};
+                constructed.push_back(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::PK_I, Vector(std::move(pubkey))));
+                ++in;
                 break;
             }
             // Time locks
@@ -2329,6 +2534,12 @@ inline NodeRef<Key> DecodeScript(I& in, I last, const Ctx& ctx)
                     in += 7;
                     break;
                 }
+            }
+            if (last - in >= 3 && in[0].first == OP_EQUAL && in[1].first == OP_TEMPLATEHASH && in[2].second.size() == 32) {
+                if (!IsTapscript(ctx.MsContext())) return {};
+                constructed.push_back(MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::TH, in[2].second));
+                in += 3;
+                break;
             }
             // Multi
             if (last - in >= 3 && in[0].first == OP_CHECKMULTISIG) {
@@ -2390,6 +2601,14 @@ inline NodeRef<Key> DecodeScript(I& in, I last, const Ctx& ctx)
                 to_parse.emplace_back(DecodeContext::SINGLE_BKV_EXPR, -1, -1);
                 break;
             }
+            // r: wrapper
+            if (last - in >= 3 && in[0].first == OP_CHECKSIGFROMSTACK && in[1].first == OP_SWAP && in[2].first == OP_TEMPLATEHASH) {
+                if (!IsTapscript(ctx.MsContext())) return {};
+                in += 3;
+                to_parse.emplace_back(DecodeContext::REBCHECK, -1, -1);
+                to_parse.emplace_back(DecodeContext::SINGLE_BKV_EXPR, -1, -1);
+                break;
+            }
             // v: wrapper
             if (in[0].first == OP_VERIFY) {
                 ++in;
@@ -2402,6 +2621,19 @@ inline NodeRef<Key> DecodeScript(I& in, I last, const Ctx& ctx)
                 ++in;
                 to_parse.emplace_back(DecodeContext::ZERO_NOTEQUAL, -1, -1);
                 to_parse.emplace_back(DecodeContext::SINGLE_BKV_EXPR, -1, -1);
+                break;
+            }
+            /** The cms(X,message) commutes with and_v() in the same way the c:X wrapper
+             * above does. Parsing and_v() as the "outer" fragment is preferable as the
+             * opposite can lead to parsing some scripts as invalid Miniscripts. For instance
+             * "1 VERIFY <pk> <message> SWAP CSFS NOTIF 1 ELSE 1 ENDIF" would otherwise be
+             * parsed as the invalid `andor(cms(and_v(v:1,pk(X)),message),1,1)` instead of
+             * the valid `and_v(v:1,andor(cms(pk(X),message),1,1))`. */
+            if (last - in >= 3 && in[0].first == OP_CHECKSIGFROMSTACK && in[1].first == OP_SWAP) {
+                if (!IsTapscript(ctx.MsContext())) return {};
+                to_parse.emplace_back(DecodeContext::CHECK_MSG, in[2].second);
+                to_parse.emplace_back(DecodeContext::SINGLE_BKV_EXPR);
+                in += 3;
                 break;
             }
             // Thresh
@@ -2481,9 +2713,20 @@ inline NodeRef<Key> DecodeScript(I& in, I last, const Ctx& ctx)
             constructed.back() = MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::WRAP_A, Vector(std::move(constructed.back())));
             break;
         }
+        case DecodeContext::REBCHECK: {
+            if (constructed.empty()) return {};
+            constructed.back() = MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::WRAP_R, Vector(std::move(constructed.back())));
+            break;
+        }
         case DecodeContext::CHECK: {
             if (constructed.empty()) return {};
             constructed.back() = MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::WRAP_C, Vector(std::move(constructed.back())));
+            break;
+        }
+        case DecodeContext::CHECK_MSG: {
+            if (constructed.empty()) return {};
+            CHECK_NONFATAL(cms_msg.has_value());
+            constructed.back() = MakeNodeRef<Key>(internal::NoDupCheck{}, ctx.MsContext(), Fragment::CMS, Vector(std::move(constructed.back())), std::move(cms_msg.value()));
             break;
         }
         case DecodeContext::DUP_IF: {

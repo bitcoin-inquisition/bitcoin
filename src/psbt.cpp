@@ -283,6 +283,9 @@ void PSBTOutput::Merge(const PSBTOutput& output)
     hd_keypaths.insert(output.hd_keypaths.begin(), output.hd_keypaths.end());
     unknown.insert(output.unknown.begin(), output.unknown.end());
     m_tap_bip32_paths.insert(output.m_tap_bip32_paths.begin(), output.m_tap_bip32_paths.end());
+    m_committed_txs.insert(output.m_committed_txs.begin(), output.m_committed_txs.end());
+    m_tap_internal_keys.insert(output.m_tap_internal_keys.begin(), output.m_tap_internal_keys.end());
+    m_tap_trees.insert(output.m_tap_trees.begin(), output.m_tap_trees.end());
 
     if (redeem_script.empty() && !output.redeem_script.empty()) redeem_script = output.redeem_script;
     if (witness_script.empty() && !output.witness_script.empty()) witness_script = output.witness_script;

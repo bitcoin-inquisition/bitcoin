@@ -59,7 +59,7 @@ bool MutableTransactionSignatureCreator::CreateSig(const SigningProvider& provid
     return true;
 }
 
-bool MutableTransactionSignatureCreator::CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* merkle_root, SigVersion sigversion) const
+bool MutableTransactionSignatureCreator::CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* merkle_root, SigVersion sigversion, std::optional<uint256> custom_msg) const
 {
     assert(sigversion == SigVersion::TAPROOT || sigversion == SigVersion::TAPSCRIPT);
 
@@ -82,11 +82,16 @@ bool MutableTransactionSignatureCreator::CreateSchnorrSig(const SigningProvider&
         execdata.m_tapleaf_hash = *leaf_hash;
     }
     uint256 hash;
-    if (!SignatureHashSchnorr(hash, execdata, m_txto, nIn, nHashType, sigversion, KeyVersion::TAPROOT, *m_txdata, MissingDataBehavior::FAIL)) return false;
+    if (custom_msg.has_value()) {
+        hash = custom_msg.value();
+    } else if (!SignatureHashSchnorr(hash, execdata, m_txto, nIn, nHashType, sigversion, KeyVersion::TAPROOT, *m_txdata, MissingDataBehavior::FAIL)) {
+        return false;
+    }
     sig.resize(64);
     // Use uint256{} as aux_rnd for now.
     if (!key.SignSchnorr(hash, sig, merkle_root, {})) return false;
-    if (nHashType) sig.push_back(nHashType);
+    // CSFS signature must not have an appended sighash type byte.
+    if (!custom_msg.has_value() && nHashType) sig.push_back(nHashType);
     return true;
 }
 
@@ -151,7 +156,7 @@ static bool CreateSig(const BaseSignatureCreator& creator, SignatureData& sigdat
     return false;
 }
 
-static bool CreateTaprootScriptSig(const BaseSignatureCreator& creator, SignatureData& sigdata, const SigningProvider& provider, std::vector<unsigned char>& sig_out, const XOnlyPubKey& pubkey, const uint256& leaf_hash, SigVersion sigversion)
+static bool CreateTaprootScriptSig(const BaseSignatureCreator& creator, SignatureData& sigdata, const SigningProvider& provider, std::vector<unsigned char>& sig_out, const XOnlyPubKey& pubkey, const uint256& leaf_hash, SigVersion sigversion, std::optional<uint256> custom_msg)
 {
     KeyOriginInfo info;
     if (provider.GetKeyOriginByXOnly(pubkey, info)) {
@@ -169,7 +174,7 @@ static bool CreateTaprootScriptSig(const BaseSignatureCreator& creator, Signatur
         sig_out = it->second;
         return true;
     }
-    if (creator.CreateSchnorrSig(provider, sig_out, pubkey, &leaf_hash, nullptr, sigversion)) {
+    if (creator.CreateSchnorrSig(provider, sig_out, pubkey, &leaf_hash, nullptr, sigversion, custom_msg)) {
         sigdata.taproot_script_sigs[lookup_key] = sig_out;
         return true;
     }
@@ -248,6 +253,19 @@ struct Satisfier {
         return MsLookupHelper(m_sig_data.hash160_preimages, hash, preimage);
     }
 
+    //! Get the template hash of the spending transaction. Like in regular signing, we only support annex-less for now.
+    uint256 GetTemplateHash() const {
+        ScriptExecutionData exec_data;
+        exec_data.m_annex_init = true;
+        exec_data.m_annex_present = false;
+        return m_creator.Checker().GetTemplateHash(exec_data);
+    }
+
+    //! Template hash satisfaction.
+    bool CheckTemplateHash(const std::vector<unsigned char>& hash) const {
+        return std::ranges::equal(hash, GetTemplateHash());
+    }
+
     miniscript::MiniscriptContext MsContext() const {
         return m_script_ctx;
     }
@@ -258,6 +276,10 @@ struct WshSatisfier: Satisfier<CPubKey> {
     explicit WshSatisfier(const SigningProvider& provider LIFETIMEBOUND, SignatureData& sig_data LIFETIMEBOUND,
                           const BaseSignatureCreator& creator LIFETIMEBOUND, const CScript& witscript LIFETIMEBOUND)
                           : Satisfier(provider, sig_data, creator, witscript, miniscript::MiniscriptContext::P2WSH) {}
+
+    CPubKey GetInternalPK() const {
+        return CPubKey{};
+    }
 
     //! Conversion from a raw compressed public key.
     template <typename I>
@@ -274,7 +296,8 @@ struct WshSatisfier: Satisfier<CPubKey> {
     }
 
     //! Satisfy an ECDSA signature check.
-    miniscript::Availability Sign(const CPubKey& key, std::vector<unsigned char>& sig) const {
+    miniscript::Availability Sign(const CPubKey& key, const miniscript::SigMsgType& sig_type, std::vector<unsigned char>& sig) const {
+        CHECK_NONFATAL(std::holds_alternative<miniscript::TxSig>(sig_type));
         if (CreateSig(m_creator, m_sig_data, m_provider, sig, key, m_witness_script, SigVersion::WITNESS_V0)) {
             return miniscript::Availability::YES;
         }
@@ -291,6 +314,10 @@ struct TapSatisfier: Satisfier<XOnlyPubKey> {
                           const uint256& leaf_hash LIFETIMEBOUND)
                           : Satisfier(provider, sig_data, creator, script, miniscript::MiniscriptContext::TAPSCRIPT),
                             m_leaf_hash(leaf_hash) {}
+
+    XOnlyPubKey GetInternalPK() const {
+        return m_sig_data.tr_spenddata.internal_key;
+    }
 
     //! Conversion from a raw xonly public key.
     template <typename I>
@@ -309,8 +336,19 @@ struct TapSatisfier: Satisfier<XOnlyPubKey> {
     }
 
     //! Satisfy a BIP340 signature check.
-    miniscript::Availability Sign(const XOnlyPubKey& key, std::vector<unsigned char>& sig) const {
-        if (CreateTaprootScriptSig(m_creator, m_sig_data, m_provider, sig, key, m_leaf_hash, SigVersion::TAPSCRIPT)) {
+    miniscript::Availability Sign(const XOnlyPubKey& key, const miniscript::SigMsgType& sig_type, std::vector<unsigned char>& sig) const {
+        std::optional<uint256> custom_msg{};
+        if (const auto* custom_sig = std::get_if<miniscript::CustomSig>(&sig_type)) {
+            // We only support signing for custom messages that are 32-byte long for now.
+            if (custom_sig->msg.size() != 32) {
+                return miniscript::Availability::NO;
+            }
+            custom_msg = uint256{custom_sig->msg};
+        }
+        if (std::holds_alternative<miniscript::TxRebSig>(sig_type)) {
+            custom_msg = GetTemplateHash();
+        }
+        if (CreateTaprootScriptSig(m_creator, m_sig_data, m_provider, sig, key, m_leaf_hash, SigVersion::TAPSCRIPT, custom_msg)) {
             return miniscript::Availability::YES;
         }
         return miniscript::Availability::NO;
@@ -733,7 +771,7 @@ public:
         vchSig[6 + m_r_len + m_s_len] = SIGHASH_ALL;
         return true;
     }
-    bool CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* tweak, SigVersion sigversion) const override
+    bool CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* tweak, SigVersion sigversion, std::optional<uint256>) const override
     {
         sig.assign(64, '\000');
         return true;

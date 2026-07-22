@@ -987,6 +987,29 @@ const RPCResult decodepsbt_outputs{
                     }},
                 }},
             }},
+            {RPCResult::Type::OBJ_DYN, "committed_transactions", /*optional=*/true, "Map from template hash to corresponding transaction details",
+            {
+                {RPCResult::Type::OBJ, "xxxx", "Committed transaction details. Not all listed fields are committed to in the template hash, and may be different in a spending transaction.",
+                {
+                    {RPCResult::Type::ELISION, "", "The layout is the same as the output of decoderawtransaction."},
+                }},
+            }},
+            {RPCResult::Type::OBJ_DYN, "taproot_internal_keys", /*optional=*/true, "Map from output key to internal key for Taproot outputs of committed transactions",
+            {
+                {RPCResult::Type::STR_HEX, "xxxx", "Taproot internal key, keyed by Taproot output key"},
+            }},
+            {RPCResult::Type::OBJ_DYN, "taproot_trees", /*optional=*/true, "Map from output key to Taproot tree for outputs of committed transactions",
+            {
+                {RPCResult::Type::ARR, "xxxx", "List of tuples that make up the Taproot tree, in depth first search order, keyed by Taproot output key",
+                {
+                    {RPCResult::Type::OBJ, "tuple", /*optional=*/ true, "A single leaf script in the taproot tree",
+                    {
+                        {RPCResult::Type::NUM, "depth", "The depth of this element in the tree"},
+                        {RPCResult::Type::NUM, "leaf_ver", "The version of this leaf"},
+                        {RPCResult::Type::STR, "script", "The hex-encoded script itself"},
+                    }},
+                }},
+            }},
             {RPCResult::Type::OBJ_DYN, "unknown", /*optional=*/true, "The unknown output fields",
             {
                 {RPCResult::Type::STR_HEX, "key", "(key-value pair) An unknown key-value pair"},
@@ -1401,6 +1424,40 @@ static RPCHelpMan decodepsbt()
                 keypaths.push_back(std::move(path_obj));
             }
             out.pushKV("taproot_bip32_derivs", std::move(keypaths));
+        }
+
+        if (!output.m_committed_txs.empty()) {
+            UniValue tx_map{UniValue::VOBJ};
+            for (const auto& [template_hash, tx]: output.m_committed_txs) {
+                UniValue tx_details{UniValue::VOBJ};
+                TxToUniv(CTransaction{tx}, /*block_hash=*/uint256{}, /*entry=*/tx_details, /*include_hex=*/false);
+                tx_map.pushKV(HexStr(template_hash), std::move(tx_details));
+            }
+            out.pushKV("committed_transactions", tx_map);
+        }
+
+        if (!output.m_tap_internal_keys.empty()) {
+            UniValue keys_map{UniValue::VOBJ};
+            for (const auto& [output_key, internal_key]: output.m_tap_internal_keys) {
+                keys_map.pushKV(HexStr(output_key), HexStr(internal_key));
+            }
+            out.pushKV("taproot_internal_keys", std::move(keys_map));
+        }
+
+        if (!output.m_tap_trees.empty()) {
+            UniValue trees_map{UniValue::VOBJ};
+            for (const auto& [output_key, tap_tree]: output.m_tap_trees) {
+                UniValue tree(UniValue::VARR);
+                for (const auto& [depth, leaf_ver, script] : tap_tree) {
+                    UniValue elem(UniValue::VOBJ);
+                    elem.pushKV("depth", depth);
+                    elem.pushKV("leaf_ver", leaf_ver);
+                    elem.pushKV("script", HexStr(script));
+                    tree.push_back(std::move(elem));
+                }
+                trees_map.pushKV(HexStr(output_key), std::move(tree));
+            }
+            out.pushKV("taproot_trees", std::move(trees_map));
         }
 
         // Proprietary

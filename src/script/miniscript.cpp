@@ -39,11 +39,11 @@ Type SanitizeType(Type e) {
 Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Type>& sub_types, uint32_t k,
                  size_t data_size, size_t n_subs, size_t n_keys, MiniscriptContext ms_ctx) {
     // Sanity check on data
-    if (fragment == Fragment::SHA256 || fragment == Fragment::HASH256) {
+    if (fragment == Fragment::SHA256 || fragment == Fragment::HASH256 || fragment == Fragment::TH) {
         assert(data_size == 32);
     } else if (fragment == Fragment::RIPEMD160 || fragment == Fragment::HASH160) {
         assert(data_size == 20);
-    } else {
+    } else if (fragment != Fragment::CMS) {
         assert(data_size == 0);
     }
     // Sanity check on k
@@ -64,13 +64,13 @@ Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Ty
         assert(n_subs == 3);
     } else if (fragment == Fragment::WRAP_A || fragment == Fragment::WRAP_S || fragment == Fragment::WRAP_C ||
                fragment == Fragment::WRAP_D || fragment == Fragment::WRAP_V || fragment == Fragment::WRAP_J ||
-               fragment == Fragment::WRAP_N) {
+               fragment == Fragment::WRAP_N || fragment == Fragment::CMS || fragment == Fragment::WRAP_R) {
         assert(n_subs == 1);
     } else if (fragment != Fragment::THRESH) {
         assert(n_subs == 0);
     }
     // Sanity check on keys
-    if (fragment == Fragment::PK_K || fragment == Fragment::PK_H) {
+    if (fragment == Fragment::PK_K || fragment == Fragment::PK_H || fragment == Fragment::PK_I) {
         assert(n_keys == 1);
     } else if (fragment == Fragment::MULTI) {
         assert(n_keys >= 1 && n_keys <= MAX_PUBKEYS_PER_MULTISIG);
@@ -86,7 +86,8 @@ Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Ty
     // It heavily relies on Type's << operator (where "X << a_mst" means
     // "X has all properties listed in a").
     switch (fragment) {
-        case Fragment::PK_K: return "Konudemsxk"_mst;
+        case Fragment::PK_K:
+        case Fragment::PK_I: return "Konudemsxk"_mst;
         case Fragment::PK_H: return "Knudemsxk"_mst;
         case Fragment::OLDER: return
             "g"_mst.If(k & CTxIn::SEQUENCE_LOCKTIME_TYPE_FLAG) |
@@ -100,52 +101,63 @@ Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Ty
         case Fragment::RIPEMD160: return "Bonudmk"_mst;
         case Fragment::HASH256: return "Bonudmk"_mst;
         case Fragment::HASH160: return "Bonudmk"_mst;
+        case Fragment::TH: return "Bzutkm"_mst;
         case Fragment::JUST_1: return "Bzufmxk"_mst;
-        case Fragment::JUST_0: return "Bzudemsxk"_mst;
+        case Fragment::JUST_0: return "Bzudemstxk"_mst;
         case Fragment::WRAP_A: return
             "W"_mst.If(x << "B"_mst) | // W=B_x
             (x & "ghijk"_mst) | // g=g_x, h=h_x, i=i_x, j=j_x, k=k_x
-            (x & "udfems"_mst) | // u=u_x, d=d_x, f=f_x, e=e_x, m=m_x, s=s_x
+            (x & "udfemst"_mst) | // u=u_x, d=d_x, f=f_x, e=e_x, m=m_x, s=s_x, t=t_x
             "x"_mst; // x
         case Fragment::WRAP_S: return
             "W"_mst.If(x << "Bo"_mst) | // W=B_x*o_x
             (x & "ghijk"_mst) | // g=g_x, h=h_x, i=i_x, j=j_x, k=k_x
-            (x & "udfemsx"_mst); // u=u_x, d=d_x, f=f_x, e=e_x, m=m_x, s=s_x, x=x_x
+            (x & "udfemstx"_mst); // u=u_x, d=d_x, f=f_x, e=e_x, m=m_x, s=s_x, t=t_x, x=x_x
         case Fragment::WRAP_C: return
             "B"_mst.If(x << "K"_mst) | // B=K_x
             (x & "ghijk"_mst) | // g=g_x, h=h_x, i=i_x, j=j_x, k=k_x
             (x & "ondfem"_mst) | // o=o_x, n=n_x, d=d_x, f=f_x, e=e_x, m=m_x
-            "us"_mst; // u, s
+            "ust"_mst; // u, s, t
+        case Fragment::WRAP_R: return
+            "B"_mst.If(x << "K"_mst) | // B=K_x
+            (x & "ghijk"_mst) | // g=g_x, h=h_x, i=i_x, j=j_x, k=k_x
+            (x & "ondfem"_mst) | // o=o_x, n=n_x, d=d_x, f=f_x, e=e_x, m=m_x
+            "ustx"_mst; // u, s, t, x
         case Fragment::WRAP_D: return
             "B"_mst.If(x << "Vz"_mst) | // B=V_x*z_x
             "o"_mst.If(x << "z"_mst) | // o=z_x
             "e"_mst.If(x << "f"_mst) | // e=f_x
             (x & "ghijk"_mst) | // g=g_x, h=h_x, i=i_x, j=j_x, k=k_x
-            (x & "ms"_mst) | // m=m_x, s=s_x
+            (x & "mst"_mst) | // m=m_x, s=s_x, t=t_x
             // NOTE: 'd:' is 'u' under Tapscript but not P2WSH as MINIMALIF is only a policy rule there.
             "u"_mst.If(IsTapscript(ms_ctx)) |
             "ndx"_mst; // n, d, x
         case Fragment::WRAP_V: return
             "V"_mst.If(x << "B"_mst) | // V=B_x
             (x & "ghijk"_mst) | // g=g_x, h=h_x, i=i_x, j=j_x, k=k_x
-            (x & "zonms"_mst) | // z=z_x, o=o_x, n=n_x, m=m_x, s=s_x
+            (x & "zonmst"_mst) | // z=z_x, o=o_x, n=n_x, m=m_x, s=s_x, t=t_x
             "fx"_mst; // f, x
         case Fragment::WRAP_J: return
             "B"_mst.If(x << "Bn"_mst) | // B=B_x*n_x
             "e"_mst.If(x << "f"_mst) | // e=f_x
             (x & "ghijk"_mst) | // g=g_x, h=h_x, i=i_x, j=j_x, k=k_x
-            (x & "oums"_mst) | // o=o_x, u=u_x, m=m_x, s=s_x
+            (x & "oumst"_mst) | // o=o_x, u=u_x, m=m_x, s=s_x, t=t_x
             "ndx"_mst; // n, d, x
         case Fragment::WRAP_N: return
             (x & "ghijk"_mst) | // g=g_x, h=h_x, i=i_x, j=j_x, k=k_x
-            (x & "Bzondfems"_mst) | // B=B_x, z=z_x, o=o_x, n=n_x, d=d_x, f=f_x, e=e_x, m=m_x, s=s_x
+            (x & "Bzondfemst"_mst) | // B=B_x, z=z_x, o=o_x, n=n_x, d=d_x, f=f_x, e=e_x, m=m_x, s=s_x, t=t_x
             "ux"_mst; // u, x
+        case Fragment::CMS: return
+            "B"_mst.If(x << "K"_mst) | // B=K_x
+            (x & "ghijk"_mst) | // g=g_x, h=h_x, i=i_x, j=j_x, k=k_x
+            (x & "tsondfem"_mst) | // t=t_x, s=s_x, o=o_x, n=n_x, d=d_x, f=f_x, e=e_x, m=m_x
+            "usx"_mst; // u, s, x
         case Fragment::AND_V: return
             (y & "KVB"_mst).If(x << "V"_mst) | // B=V_x*B_y, V=V_x*V_y, K=V_x*K_y
             (x & "n"_mst) | (y & "n"_mst).If(x << "z"_mst) | // n=n_x+z_x*n_y
             ((x | y) & "o"_mst).If((x | y) << "z"_mst) | // o=o_x*z_y+z_x*o_y
             (x & y & "dmz"_mst) | // d=d_x*d_y, m=m_x*m_y, z=z_x*z_y
-            ((x | y) & "s"_mst) | // s=s_x+s_y
+            ((x | y) & "st"_mst) | // s=s_x+s_y, t=t_x+t_y
             "f"_mst.If((y << "f"_mst) || (x << "s"_mst)) | // f=f_y+s_x
             (y & "ux"_mst) | // u=u_y, x=x_y
             ((x | y) & "ghij"_mst) | // g=g_x+g_y, h=h_x+h_y, i=i_x+i_y, j=j_x+j_y
@@ -161,7 +173,7 @@ Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Ty
             (x & y & "e"_mst).If((x & y) << "s"_mst) | // e=e_x*e_y*s_x*s_y
             (x & y & "dzm"_mst) | // d=d_x*d_y, z=z_x*z_y, m=m_x*m_y
             "f"_mst.If(((x & y) << "f"_mst) || (x << "sf"_mst) || (y << "sf"_mst)) | // f=f_x*f_y + f_x*s_x + f_y*s_y
-            ((x | y) & "s"_mst) | // s=s_x+s_y
+            ((x | y) & "ts"_mst) | // s=s_x+s_y, t=t_x+t_y
             "ux"_mst | // u, x
             ((x | y) & "ghij"_mst) | // g=g_x+g_y, h=h_x+h_y, i=i_x+i_y, j=j_x+j_y
             "k"_mst.If(((x & y) << "k"_mst) &&
@@ -173,7 +185,7 @@ Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Ty
             "B"_mst.If(x << "Bd"_mst && y << "Wd"_mst) | // B=B_x*d_x*W_x*d_y
             ((x | y) & "o"_mst).If((x | y) << "z"_mst) | // o=o_x*z_y+z_x*o_y
             (x & y & "m"_mst).If((x | y) << "s"_mst && (x & y) << "e"_mst) | // m=m_x*m_y*e_x*e_y*(s_x+s_y)
-            (x & y & "zse"_mst) | // z=z_x*z_y, s=s_x*s_y, e=e_x*e_y
+            (x & y & "zset"_mst) | // z=z_x*z_y, s=s_x*s_y, e=e_x*e_y, t=t_x*t_y
             "dux"_mst | // d, u, x
             ((x | y) & "ghij"_mst) | // g=g_x+g_y, h=h_x+h_y, i=i_x+i_y, j=j_x+j_y
             (x & y & "k"_mst); // k=k_x*k_y
@@ -181,7 +193,7 @@ Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Ty
             (y & "B"_mst).If(x << "Bdu"_mst) | // B=B_y*B_x*d_x*u_x
             (x & "o"_mst).If(y << "z"_mst) | // o=o_x*z_y
             (x & y & "m"_mst).If(x << "e"_mst && (x | y) << "s"_mst) | // m=m_x*m_y*e_x*(s_x+s_y)
-            (x & y & "zs"_mst) | // z=z_x*z_y, s=s_x*s_y
+            (x & y & "zst"_mst) | // z=z_x*z_y, s=s_x*s_y, t=t_x*t_y
             (y & "ufde"_mst) | // u=u_y, f=f_y, d=d_y, e=e_y
             "x"_mst | // x
             ((x | y) & "ghij"_mst) | // g=g_x+g_y, h=h_x+h_y, i=i_x+i_y, j=j_x+j_y
@@ -190,12 +202,12 @@ Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Ty
             (y & "V"_mst).If(x << "Bdu"_mst) | // V=V_y*B_x*u_x*d_x
             (x & "o"_mst).If(y << "z"_mst) | // o=o_x*z_y
             (x & y & "m"_mst).If(x << "e"_mst && (x | y) << "s"_mst) | // m=m_x*m_y*e_x*(s_x+s_y)
-            (x & y & "zs"_mst) | // z=z_x*z_y, s=s_x*s_y
+            (x & y & "zst"_mst) | // z=z_x*z_y, s=s_x*s_y, t=t_x*t_y
             "fx"_mst | // f, x
             ((x | y) & "ghij"_mst) | // g=g_x+g_y, h=h_x+h_y, i=i_x+i_y, j=j_x+j_y
             (x & y & "k"_mst); // k=k_x*k_y
         case Fragment::OR_I: return
-            (x & y & "VBKufs"_mst) | // V=V_x*V_y, B=B_x*B_y, K=K_x*K_y, u=u_x*u_y, f=f_x*f_y, s=s_x*s_y
+            (x & y & "VBKufst"_mst) | // V=V_x*V_y, B=B_x*B_y, K=K_x*K_y, u=u_x*u_y, f=f_x*f_y, s=s_x*s_y, t=t_x*t_y
             "o"_mst.If((x & y) << "z"_mst) | // o=z_x*z_y
             ((x | y) & "e"_mst).If((x | y) << "f"_mst) | // e=e_x*f_y+f_x*e_y
             (x & y & "m"_mst).If((x | y) << "s"_mst) | // m=m_x*m_y*(s_x+s_y)
@@ -212,7 +224,7 @@ Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Ty
             (z & "d"_mst) | // d=d_z
             (z & "e"_mst).If(x << "s"_mst || y << "f"_mst) | // e=e_z*(s_x+f_y)
             (x & y & z & "m"_mst).If(x << "e"_mst && (x | y | z) << "s"_mst) | // m=m_x*m_y*m_z*e_x*(s_x+s_y+s_z)
-            (z & (x | y) & "s"_mst) | // s=s_z*(s_x+s_y)
+            (z & (x | y) & "st"_mst) | // s=s_z*(s_x+s_y), t=t_z*(t_x+t_y)
             "x"_mst | // x
             ((x | y | z) & "ghij"_mst) | // g=g_x+g_y+g_z, h=h_x+h_y+h_z, i=i_x+i_y+i_z, j=j_x+j_y_j_z
             "k"_mst.If(((x & y & z) << "k"_mst) &&
@@ -221,16 +233,17 @@ Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Ty
                 ((x << "i"_mst) && (y << "j"_mst)) ||
                 ((x << "j"_mst) && (y << "i"_mst)))); // k=k_x*k_y*k_z* !(g_x*h_y + h_x*g_y + i_x*j_y + j_x*i_y)
         case Fragment::MULTI: {
-            return "Bnudemsk"_mst;
+            return "Bnudemstk"_mst;
         }
         case Fragment::MULTI_A: {
-            return "Budemsk"_mst;
+            return "Budemstk"_mst;
         }
         case Fragment::THRESH: {
             bool all_e = true;
             bool all_m = true;
             uint32_t args = 0;
             uint32_t num_s = 0;
+            uint32_t num_t = 0;
             Type acc_tl = "k"_mst;
             for (size_t i = 0; i < sub_types.size(); ++i) {
                 Type t = sub_types[i];
@@ -239,6 +252,7 @@ Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Ty
                 if (!(t << "e"_mst)) all_e = false;
                 if (!(t << "m"_mst)) all_m = false;
                 if (t << "s"_mst) num_s += 1;
+                if (t << "t"_mst) num_t += 1;
                 args += (t << "z"_mst) ? 0 : (t << "o"_mst) ? 1 : 2;
                 acc_tl = ((acc_tl | t) & "ghij"_mst) |
                     // Thresh contains a combination of timelocks if it has threshold > 1 and
@@ -256,6 +270,7 @@ Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Ty
                    "e"_mst.If(all_e && num_s == n_subs) | // e=all e and all s
                    "m"_mst.If(all_e && all_m && num_s >= n_subs - k) | // m=all e, >=(n-k) s
                    "s"_mst.If(num_s >= n_subs - k + 1) |  // s= >=(n-k+1) s
+                   "t"_mst.If(num_t >= n_subs - k + 1) |  // t= >=(n-k+1) t
                    acc_tl; // timelock info
             }
     }
@@ -263,18 +278,20 @@ Type ComputeType(Fragment fragment, Type x, Type y, Type z, const std::vector<Ty
 }
 
 size_t ComputeScriptLen(Fragment fragment, Type sub0typ, size_t subsize, uint32_t k, size_t n_subs,
-                        size_t n_keys, MiniscriptContext ms_ctx) {
+                        size_t n_keys, MiniscriptContext ms_ctx, const std::vector<unsigned char>& data) {
     switch (fragment) {
         case Fragment::JUST_1:
         case Fragment::JUST_0: return 1;
         case Fragment::PK_K: return IsTapscript(ms_ctx) ? 33 : 34;
         case Fragment::PK_H: return 3 + 21;
+        case Fragment::PK_I: return 1;
         case Fragment::OLDER:
         case Fragment::AFTER: return 1 + BuildScript(k).size();
         case Fragment::HASH256:
         case Fragment::SHA256: return 4 + 2 + 33;
         case Fragment::HASH160:
         case Fragment::RIPEMD160: return 4 + 2 + 21;
+        case Fragment::TH: return 33 + 2;
         case Fragment::MULTI: return 1 + BuildScript(n_keys).size() + BuildScript(k).size() + 34 * n_keys;
         case Fragment::MULTI_A: return (1 + 32 + 1) * n_keys + BuildScript(k).size() + 1;
         case Fragment::AND_V: return subsize;
@@ -284,6 +301,7 @@ size_t ComputeScriptLen(Fragment fragment, Type sub0typ, size_t subsize, uint32_
         case Fragment::WRAP_N:
         case Fragment::AND_B:
         case Fragment::OR_B: return subsize + 1;
+        case Fragment::CMS: return subsize + BuildScript(data).size() + 2;
         case Fragment::WRAP_A:
         case Fragment::OR_C: return subsize + 2;
         case Fragment::WRAP_D:
@@ -291,6 +309,7 @@ size_t ComputeScriptLen(Fragment fragment, Type sub0typ, size_t subsize, uint32_
         case Fragment::OR_I:
         case Fragment::ANDOR: return subsize + 3;
         case Fragment::WRAP_J: return subsize + 4;
+        case Fragment::WRAP_R: return subsize + 1 + 1 + 1;
         case Fragment::THRESH: return subsize + n_subs + BuildScript(k).size();
     }
     assert(false);
@@ -301,10 +320,16 @@ InputStack& InputStack::SetAvailable(Availability avail) {
     if (avail == Availability::NO) {
         stack.clear();
         size = std::numeric_limits<size_t>::max();
+        commits_tx = false;
         has_sig = false;
         malleable = false;
         non_canon = false;
     }
+    return *this;
+}
+
+InputStack& InputStack::SetCommitsTx() {
+    commits_tx = true;
     return *this;
 }
 
@@ -326,6 +351,7 @@ InputStack& InputStack::SetMalleable(bool x) {
 InputStack operator+(InputStack a, InputStack b) {
     a.stack = Cat(std::move(a.stack), std::move(b.stack));
     if (a.available != Availability::NO && b.available != Availability::NO) a.size += b.size;
+    a.commits_tx |= b.commits_tx;
     a.has_sig |= b.has_sig;
     a.malleable |= b.malleable;
     a.non_canon |= b.non_canon;
@@ -427,6 +453,16 @@ int FindNextChar(Span<const char> sp, const char m)
         if (sp[i] == ')') break;
     }
     return -1;
+}
+
+std::optional<std::pair<std::vector<unsigned char>, int>> ParseArbHexStrEnd(Span<const char> in)
+{
+    int size = FindNextChar(in, ')');
+    if (size < 1) return {};
+    std::string hex{in.begin(), in.begin() + size};
+    if (!IsHex(hex)) return {};
+    auto data = ParseHex(hex);
+    return {{std::move(data), size}};
 }
 
 } // namespace internal

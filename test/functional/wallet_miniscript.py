@@ -55,7 +55,14 @@ DESCS = [
     f"tr(4d54bb9928a0683b7e383de72943b214b0716f58aa54c7ba6bcea2328bc9c768,{{{{{P2WSH_MINISCRIPTS[0]},{P2WSH_MINISCRIPTS[1]}}},{P2WSH_MINISCRIPTS[2].replace('multi', 'multi_a')}}})",
     # A Taproot with all above scripts in its tree.
     f"tr(4d54bb9928a0683b7e383de72943b214b0716f58aa54c7ba6bcea2328bc9c768,{{{{{P2WSH_MINISCRIPTS[0]},{P2WSH_MINISCRIPTS[1]}}},{{{P2WSH_MINISCRIPTS[2].replace('multi', 'multi_a')},{P2WSH_MINISCRIPTS[3]}}}}})",
+    # A Taproot with an OP_INTERNALKEY in one of the leaves.
+    f"tr({TPUBS[0]}/*,{{thresh(2,pki(),a:multi_a(1,{TPUBS[1]}/*)),pk({TPUBS[2]})}})",
+    # A Taproot with a leaf that may only be spent by a specific transaction.
+    f"tr({TPUBS[0]}/*,th(54ab1fa5f9ea585d0f9674163276bbbde113a9f3328034977a3b3170cc3a9234))",
 ]
+
+# As a separate variable, because as a literal inside an f-string it triggers linter false-positives.
+DUMMY_32B_MSG_HEX = "ab" * 32
 
 DESCS_PRIV = [
     # One of two keys, of which one private key is known
@@ -199,6 +206,31 @@ DESCS_PRIV = [
         "sigs_count": 2,
         "stack_size": 8,
     },
+    # A signature for an arbitrary message in a timelocked leaf, the immediately-available alternatives being unavailable.
+    {
+        "desc": f"tr({TPUBS[0]}/*,{{and_v(v:pk({TPRVS[1]}/*),and_b(dv:after(42),a:cms(pk_h({TPRVS[2]}/*),{DUMMY_32B_MSG_HEX}))),pk({TPUBS[3]}/*)}})",
+        "sequence": None,
+        "locktime": 42,
+        "sigs_count": 2,
+        "stack_size": 6,
+    },
+    # Very same descriptor as above, but with a 31-byte arbitrary message. Fails as signing is only implemented for 32-byte messages.
+    {
+        "desc": f"tr({TPUBS[0]}/*,{{and_v(v:pk({TPRVS[1]}/*),and_b(dv:after(42),a:cms(pk_h({TPRVS[2]}/*),{DUMMY_32B_MSG_HEX[:62]}))),pk({TPUBS[3]}/*)}})",
+        "sequence": None,
+        "locktime": 42,
+        "sigs_count": 1,
+        "stack_size": None,
+    },
+    # LN-Symmetry update transaction output script with a regular pk_k() as the rebindable signature key instead of OP_IK because
+    # using the latter would lead to always finalizing through the key spend path, and with settlement tx template hash 424242..
+    {
+        "desc": f"tr({TPUBS[0]}/*,{{and_v(vr:pk_k({TPRVS[1]}),after(21)),th(4242424242424242424242424242424242424242424242424242424242424242)}})",
+        "sequence": None,
+        "locktime": 21,
+        "sigs_count": 1,
+        "stack_size": 3,
+    }
 ]
 
 
@@ -345,7 +377,7 @@ class WalletMiniscriptTest(BitcoinTestFramework):
             ]
         )[0]
         assert not res["success"]
-        assert "is not sane: witnesses without signature exist" in res["error"]["message"]
+        assert "is not sane: witnesses that don't commit to spending transaction exist" in res["error"]["message"]
 
         # Sanity check we wouldn't let an unspendable Miniscript descriptor in
         res = self.ms_wo_wallet.importdescriptors(

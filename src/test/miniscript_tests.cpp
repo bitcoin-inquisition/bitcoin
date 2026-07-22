@@ -29,6 +29,9 @@ namespace {
 
 /** TestData groups various kinds of precomputed data necessary in this test. */
 struct TestData {
+    // All our signatures sign (and are required to sign) this constant message. Also used as the template hash.
+    static constexpr uint256 MESSAGE_HASH{"0000000000000000f5cd94e18b6fe77dd7aca9e35c2b0c9cbd86356c80a71065"};
+
     //! The only public keys used in this test.
     std::vector<CPubKey> pubkeys;
     //! A map from the public keys to their CKeyIDs (faster than hashing every time).
@@ -48,17 +51,19 @@ struct TestData {
     std::map<std::vector<unsigned char>, std::vector<unsigned char>> hash256_preimages;
     std::map<std::vector<unsigned char>, std::vector<unsigned char>> hash160_preimages;
 
+    // Precomputed 32-byte messages and a valid signatures for each.
+    std::vector<std::vector<uint8_t>> custom_messages;
+    std::map<XOnlyPubKey, std::map<std::vector<uint8_t>, std::vector<uint8_t>>> custom_sigs;
+
     TestData()
     {
-        // All our signatures sign (and are required to sign) this constant message.
-        constexpr uint256 MESSAGE_HASH{"0000000000000000f5cd94e18b6fe77dd7aca9e35c2b0c9cbd86356c80a71065"};
         // We don't pass additional randomness when creating a schnorr signature.
         const auto EMPTY_AUX{uint256::ZERO};
+        // This 32-byte array functions as both private key data and hash preimage (31 zero bytes plus any nonzero byte).
+        unsigned char keydata[32] = {0};
 
         // We generate 255 public keys and 255 hashes of each type.
         for (int i = 1; i <= 255; ++i) {
-            // This 32-byte array functions as both private key data and hash preimage (31 zero bytes plus any nonzero byte).
-            unsigned char keydata[32] = {0};
             keydata[31] = i;
 
             // Compute CPubkey and CKeyID
@@ -99,6 +104,24 @@ struct TestData {
             CHash160().Write(keydata).Finalize(hash);
             hash160.push_back(hash);
             hash160_preimages[hash] = std::vector<unsigned char>(keydata, keydata + 32);
+
+            // Only 3 different custom messages, since we need a valid signature for each.
+            if (i < 4) {
+                custom_messages.emplace_back(sha256.back());
+            }
+        }
+
+        for (size_t i{1}; i <= 255; ++i) {
+            CKey privkey;
+            keydata[31] = i;
+            privkey.Set(keydata, keydata + 32, true);
+            XOnlyPubKey pubkey{privkey.GetPubKey()};
+
+            for (const auto& msg: custom_messages) {
+                std::vector<uint8_t> sig(64);
+                Assert(privkey.SignSchnorr(uint256{msg}, sig, nullptr, EMPTY_AUX));
+                custom_sigs[pubkey][msg] = std::move(sig);
+            }
         }
     }
 };
@@ -112,9 +135,11 @@ enum class ChallengeType {
     RIPEMD160,
     HASH256,
     HASH160,
+    TEMPLATEHASH,
     OLDER,
     AFTER,
-    PK
+    PK_TX, //!< A PK challenge for a transaction signature check
+    PK_CUSTOM, //!< A PK challenge for a custom signature check
 };
 
 /* With each leaf condition we associate a challenge number.
@@ -131,8 +156,10 @@ struct KeyConverter {
     typedef CPubKey Key;
 
     const miniscript::MiniscriptContext m_script_ctx;
+    const CPubKey m_tr_internal_key;
 
-    constexpr KeyConverter(miniscript::MiniscriptContext ctx) noexcept : m_script_ctx{ctx} {}
+    KeyConverter(miniscript::MiniscriptContext ctx, CPubKey tr_internal_key) noexcept
+        : m_script_ctx{ctx}, m_tr_internal_key{tr_internal_key} {}
 
     bool KeyCompare(const Key& a, const Key& b) const {
         return a < b;
@@ -195,12 +222,16 @@ struct KeyConverter {
     miniscript::MiniscriptContext MsContext() const {
         return m_script_ctx;
     }
+
+    Key GetInternalPK() const {
+        return m_tr_internal_key;
+    }
 };
 
 /** A class that encapsulates all signing/hash revealing operations. */
 struct Satisfier : public KeyConverter {
 
-    Satisfier(miniscript::MiniscriptContext ctx) noexcept : KeyConverter{ctx} {}
+    Satisfier(miniscript::MiniscriptContext ctx, CPubKey tr_internal_key) noexcept : KeyConverter{ctx, tr_internal_key} {}
 
     //! Which keys/timelocks/hash preimages are available.
     std::set<Challenge> supported;
@@ -216,8 +247,10 @@ struct Satisfier : public KeyConverter {
     }
 
     //! Produce a signature for the given key.
-    miniscript::Availability Sign(const CPubKey& key, std::vector<unsigned char>& sig) const {
-        if (supported.count(Challenge(ChallengeType::PK, ChallengeNumber(key)))) {
+    miniscript::Availability Sign(const CPubKey& key, const miniscript::SigMsgType& sig_type, std::vector<unsigned char>& sig) const {
+        Assert(miniscript::IsTapscript(m_script_ctx) || std::holds_alternative<miniscript::TxSig>(sig_type));
+
+        if (CommitsTx(sig_type) && supported.count(Challenge(ChallengeType::PK_TX, ChallengeNumber(key)))) {
             if (!miniscript::IsTapscript(m_script_ctx)) {
                 auto it = g_testdata->signatures.find(key);
                 if (it == g_testdata->signatures.end()) return miniscript::Availability::NO;
@@ -226,9 +259,29 @@ struct Satisfier : public KeyConverter {
                 auto it = g_testdata->schnorr_signatures.find(XOnlyPubKey{key});
                 if (it == g_testdata->schnorr_signatures.end()) return miniscript::Availability::NO;
                 sig = it->second;
+                // Since all dummy sigs sign TestData::MESSAGE_HASH, and it is also used as the template hash,
+                // then dummy signatures are valid for both regular sig checks and rebindable sig checks with
+                // the exception that rebindable sigs should not have a sighash type byte.
+                if (std::holds_alternative<miniscript::TxRebSig>(sig_type)) {
+                    sig.pop_back();
+                    Assert(sig.size() == 64);
+                }
             }
             return miniscript::Availability::YES;
         }
+
+        if (supported.count(Challenge(ChallengeType::PK_CUSTOM, ChallengeNumber(key)))) {
+            if (const auto* custom = std::get_if<miniscript::CustomSig>(&sig_type)) {
+                const auto it{g_testdata->custom_sigs.find(XOnlyPubKey{key})};
+                if (it == g_testdata->custom_sigs.end()) return miniscript::Availability::NO;
+                std::vector<uint8_t> msg_owned{custom->msg.begin(), custom->msg.end()};
+                const auto sec_it{it->second.find(msg_owned)};
+                if (sec_it == it->second.end()) return miniscript::Availability::NO;
+                sig = sec_it->second;
+                return miniscript::Availability::YES;
+            }
+        }
+
         return miniscript::Availability::NO;
     }
 
@@ -251,6 +304,10 @@ struct Satisfier : public KeyConverter {
     miniscript::Availability SatRIPEMD160(const std::vector<unsigned char>& hash, std::vector<unsigned char>& preimage) const { return SatHash(hash, preimage, ChallengeType::RIPEMD160); }
     miniscript::Availability SatHASH256(const std::vector<unsigned char>& hash, std::vector<unsigned char>& preimage) const { return SatHash(hash, preimage, ChallengeType::HASH256); }
     miniscript::Availability SatHASH160(const std::vector<unsigned char>& hash, std::vector<unsigned char>& preimage) const { return SatHash(hash, preimage, ChallengeType::HASH160); }
+
+    bool CheckTemplateHash(const std::vector<unsigned char>& data) const {
+        return supported.count(Challenge(ChallengeType::TEMPLATEHASH, ChallengeNumber(data))) && uint256{data} == TestData::MESSAGE_HASH;
+    }
 };
 
 /** Mocking signature/timelock checker.
@@ -289,6 +346,10 @@ public:
         // Delegate to Satisfier.
         return ctx.CheckOlder(sequence.GetInt64());
     }
+
+    uint256 GetTemplateHash(ScriptExecutionData&) const override {
+        return TestData::MESSAGE_HASH;
+    }
 };
 
 using Fragment = miniscript::Fragment;
@@ -296,12 +357,27 @@ using NodeRef = miniscript::NodeRef<CPubKey>;
 using miniscript::operator""_mst;
 using Node = miniscript::Node<CPubKey>;
 
+miniscript::SigMsgType NodeSigType(miniscript::SigMsgType parent_sig_type, const NodeRef& node) {
+    if (node->fragment == Fragment::WRAP_C) {
+        return miniscript::TxSig{};
+    } else if (node->fragment == Fragment::CMS) {
+        return miniscript::CustomSig{.msg = std::span<const uint8_t>{node->data}};
+    } else if (node->fragment == Fragment::WRAP_R) {
+        return miniscript::TxRebSig{};
+    }
+    return parent_sig_type;
+};
+
 /** Compute all challenges (pubkeys, hashes, timelocks) that occur in a given Miniscript. */
 // NOLINTNEXTLINE(misc-no-recursion)
-std::set<Challenge> FindChallenges(const NodeRef& ref) {
+std::set<Challenge> FindChallenges(const NodeRef& ref, miniscript::SigMsgType sig_type) {
     std::set<Challenge> chal;
     for (const auto& key : ref->keys) {
-        chal.emplace(ChallengeType::PK, ChallengeNumber(key));
+        if (ref->fragment == Fragment::MULTI_A || ref->fragment == Fragment::MULTI || miniscript::CommitsTx(sig_type)) {
+            chal.emplace(ChallengeType::PK_TX, ChallengeNumber(key));
+        } else {
+            chal.emplace(ChallengeType::PK_CUSTOM, ChallengeNumber(key));
+        }
     }
     if (ref->fragment == miniscript::Fragment::OLDER) {
         chal.emplace(ChallengeType::OLDER, ref->k);
@@ -315,22 +391,25 @@ std::set<Challenge> FindChallenges(const NodeRef& ref) {
         chal.emplace(ChallengeType::HASH256, ChallengeNumber(ref->data));
     } else if (ref->fragment == miniscript::Fragment::HASH160) {
         chal.emplace(ChallengeType::HASH160, ChallengeNumber(ref->data));
+    } else if (ref->fragment == miniscript::Fragment::TH) {
+        chal.emplace(ChallengeType::TEMPLATEHASH, ChallengeNumber(ref->data));
     }
+    const auto parent_sig_type{NodeSigType(sig_type, ref)};
     for (const auto& sub : ref->subs) {
-        auto sub_chal = FindChallenges(sub);
+        auto sub_chal = FindChallenges(sub, parent_sig_type);
         chal.insert(sub_chal.begin(), sub_chal.end());
     }
     return chal;
 }
 
 //! The spk for this script under the given context. If it's a Taproot output also record the spend data.
-CScript ScriptPubKey(miniscript::MiniscriptContext ctx, const CScript& script, TaprootBuilder& builder)
+CScript ScriptPubKey(const KeyConverter& converter, const CScript& script, TaprootBuilder& builder)
 {
-    if (!miniscript::IsTapscript(ctx)) return CScript() << OP_0 << WitnessV0ScriptHash(script);
+    if (!miniscript::IsTapscript(converter.MsContext())) return CScript() << OP_0 << WitnessV0ScriptHash(script);
 
     // For Taproot outputs we always use a tree with a single script and a dummy internal key.
     builder.Add(0, script, TAPROOT_LEAF_TAPSCRIPT);
-    builder.Finalize(XOnlyPubKey::NUMS_H);
+    builder.Finalize(XOnlyPubKey{converter.GetInternalPK()});
     return GetScriptForDestination(builder.GetOutput());
 }
 
@@ -347,11 +426,11 @@ struct MiniScriptTest : BasicTestingSetup {
 /** Run random satisfaction tests. */
 void TestSatisfy(const KeyConverter& converter, const std::string& testcase, const NodeRef& node) {
     auto script = node->ToScript(converter);
-    auto challenges = FindChallenges(node); // Find all challenges in the generated miniscript.
+    auto challenges = FindChallenges(node, miniscript::NoSig{}); // Find all challenges in the generated miniscript.
     std::vector<Challenge> challist(challenges.begin(), challenges.end());
     for (int iter = 0; iter < 3; ++iter) {
         std::shuffle(challist.begin(), challist.end(), m_rng);
-        Satisfier satisfier(converter.MsContext());
+        Satisfier satisfier(converter.MsContext(), converter.GetInternalPK());
         TestSignatureChecker checker(satisfier);
         bool prev_mal_success = false, prev_nonmal_success = false;
         // Go over all challenges involved in this miniscript in random order.
@@ -360,7 +439,7 @@ void TestSatisfy(const KeyConverter& converter, const std::string& testcase, con
 
             // Get the ScriptPubKey for this script, filling spend data if it's Taproot.
             TaprootBuilder builder;
-            const CScript script_pubkey{ScriptPubKey(converter.MsContext(), script, builder)};
+            const CScript script_pubkey{ScriptPubKey(converter, script, builder)};
 
             // Run malleable satisfaction algorithm.
             CScriptWitness witness_mal;
@@ -413,10 +492,10 @@ void TestSatisfy(const KeyConverter& converter, const std::string& testcase, con
 
             // Adding more satisfied conditions can never remove our ability to produce a satisfaction.
             BOOST_CHECK(mal_success >= prev_mal_success);
-            // For nonmalleable solutions this is only true if the added condition is PK;
+            // For nonmalleable solutions this is only true if the added condition is a PK that commits to the transaction;
             // for other conditions, adding one may make an valid satisfaction become malleable. If the script
             // is sane, this cannot happen however.
-            if (node->IsSane() || add < 0 || challist[add].first == ChallengeType::PK) {
+            if (node->IsSane() || add < 0 || challist[add].first == ChallengeType::PK_TX) {
                 BOOST_CHECK(nonmal_success >= prev_nonmal_success);
             }
             // Remember results for the next added challenge.
@@ -424,7 +503,12 @@ void TestSatisfy(const KeyConverter& converter, const std::string& testcase, con
             prev_nonmal_success = nonmal_success;
         }
 
-        bool satisfiable = node->IsSatisfiable([](const Node&) { return true; });
+        bool satisfiable = node->IsSatisfiable([](const Node& node) {
+            if (node.fragment == Fragment::TH && uint256{node.data} != TestData::MESSAGE_HASH) {
+                return false;
+            }
+            return true;
+        });
         // If the miniscript was satisfiable at all, a satisfaction must be found after all conditions are added.
         BOOST_CHECK_EQUAL(prev_mal_success, satisfiable);
         // If the miniscript is sane and satisfiable, a nonmalleable satisfaction must eventually be found.
@@ -462,7 +546,7 @@ void Test(const std::string& ms, const std::string& hexscript, int mode, const K
         BOOST_CHECK_MESSAGE(node->ScriptSize() == computed_script.size(), "Script size mismatch: " + ms);
         if (hexscript != "?") BOOST_CHECK_MESSAGE(HexStr(computed_script) == hexscript, "Script mismatch: " + ms + " (" + HexStr(computed_script) + " vs " + hexscript + ")");
         BOOST_CHECK_MESSAGE(node->IsNonMalleable() == !!(mode & TESTMODE_NONMAL), "Malleability mismatch: " + ms);
-        BOOST_CHECK_MESSAGE(node->NeedsSignature() == !!(mode & TESTMODE_NEEDSIG), "Signature necessity mismatch: " + ms);
+        BOOST_CHECK_MESSAGE(node->CommitsToTx() == !!(mode & TESTMODE_NEEDSIG), "Signature necessity mismatch: " + ms);
         BOOST_CHECK_MESSAGE((node->GetType() << "k"_mst) == !(mode & TESTMODE_TIMELOCKMIX), "Timelock mix mismatch: " + ms);
         auto inferred_miniscript = miniscript::FromScript(computed_script, converter);
         BOOST_CHECK_MESSAGE(inferred_miniscript, "Cannot infer miniscript from script: " + ms);
@@ -480,9 +564,10 @@ void Test(const std::string& ms, const std::string& hexscript, const std::string
           std::optional<uint32_t> max_tap_wit_size,
           std::optional<uint32_t> stack_exec)
 {
-    KeyConverter wsh_converter(miniscript::MiniscriptContext::P2WSH);
+    KeyConverter wsh_converter(miniscript::MiniscriptContext::P2WSH, /*tr_internal_key=*/CPubKey{});
     Test(ms, hexscript, mode, wsh_converter, opslimit, stacklimit, max_wit_size, stack_exec);
-    KeyConverter tap_converter(miniscript::MiniscriptContext::TAPSCRIPT);
+    const auto internal_pubkey{g_testdata->pubkeys[g_testdata->pubkeys.size() - 1]};
+    KeyConverter tap_converter(miniscript::MiniscriptContext::TAPSCRIPT, /*tr_internal_key=*/internal_pubkey);
     Test(ms, hextapscript == "=" ? hexscript : hextapscript, mode, tap_converter, opslimit, stacklimit, max_tap_wit_size, stack_exec);
 }
 
@@ -596,8 +681,8 @@ BOOST_AUTO_TEST_CASE(fixed_tests)
     //  - no pubkey at all
     //  - no pubkey before a CHECKSIGADD
     //  - no pubkey before the CHECKSIG
-    constexpr KeyConverter tap_converter{miniscript::MiniscriptContext::TAPSCRIPT};
-    constexpr KeyConverter wsh_converter{miniscript::MiniscriptContext::P2WSH};
+    const KeyConverter tap_converter{miniscript::MiniscriptContext::TAPSCRIPT, /*tr_internal_key=*/XOnlyPubKey::NUMS_H.GetEvenCorrespondingCPubKey()};
+    const KeyConverter wsh_converter{miniscript::MiniscriptContext::P2WSH, /*tr_internal_key=*/CPubKey{}};
     const auto no_pubkey{"ac519c"_hex_u8};
     BOOST_CHECK(miniscript::FromScript({no_pubkey.begin(), no_pubkey.end()}, tap_converter) == nullptr);
     const auto incomplete_multi_a{"ba20c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5ba519c"_hex_u8};
@@ -722,6 +807,60 @@ BOOST_AUTO_TEST_CASE(fixed_tests)
     Test("thresh(2,ltv:after(1000000000),altv:after(100),a:pk(03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65))", "?", "?", TESTMODE_VALID | TESTMODE_TIMELOCKMIX | TESTMODE_NONMAL); // thresh with k = 2
     // This is actually non-malleable in practice, but we cannot detect it in type system. See above rationale
     Test("thresh(1,c:pk_k(03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65),altv:after(1000000000),altv:after(100))", "?", "?", TESTMODE_VALID); // thresh with k = 1
+
+    // OP_INTERNALKEY, OP_TEMPLATEHASH and OP_CHECKSIGFROMSTACK tests
+    Test("and_b(older(42),sc:pk_i())", "012ab27ccbac9a", "012ab27ccbac9a", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_NEEDSIG | TESTMODE_P2WSH_INVALID);
+    Test("and_b(older(42),s:pki())", "012ab27ccbac9a", "012ab27ccbac9a", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_NEEDSIG | TESTMODE_P2WSH_INVALID);
+    std::string ms_ik{"and_b(older(42),ac:or_i(pk_i(),pk_h("};
+    ms_ik += HexStr(g_testdata->pubkeys[21]) + ")))";
+    Test(ms_ik, "?", "?", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_NEEDSIG | TESTMODE_P2WSH_INVALID);
+    Test("th(8bbd5b2f0852f2b4d3844bbec1628821c3ea6eeb117ded96558b48e36b27e45d)", "", "208bbd5b2f0852f2b4d3844bbec1628821c3ea6eeb117ded96558b48e36b27e45dce87", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_NEEDSIG | TESTMODE_P2WSH_INVALID);
+    Test("or_i(pk(03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65),and_v(v:th(d180e2ecc3e5a2360a5569c1ace901550b9bc6939b96ffa0f1403db8581e56f1),pk(037c04d6fdc6920f2f278f6d479f64f765c0e0421e9d4233325c0ce7e7253088ee)))", "", "?", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_NEEDSIG | TESTMODE_P2WSH_INVALID);
+    std::string ms_th{"and_b(older(42),a:th("};
+    ms_th += HexStr(TestData::MESSAGE_HASH) + "))";
+    Test(ms_th, "", "?", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_NEEDSIG | TESTMODE_P2WSH_INVALID);
+    for (const size_t hash_size : {31U, 33U}) {
+        const std::vector<unsigned char> invalid_hash(hash_size, 0x42);
+        const CScript invalid_th_script{CScript{} << invalid_hash << OP_TEMPLATEHASH << OP_EQUAL};
+        BOOST_CHECK(!miniscript::FromScript(invalid_th_script, tap_converter));
+    }
+    Test("cms(pk_k(02e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13),ec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc5)", "20e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd1320ec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc57ccc", "20e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd1320ec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc57ccc", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_P2WSH_INVALID);
+    Test("or_i(and_b(hash160(20195b5a3d650c17f0f29f91c33f8f6335193d07),a:cms(pk_k(02e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13),ec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc5)),and_v(v:older(42),pkh(025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc)))", "6382012088a91420195b5a3d650c17f0f29f91c33f8f6335193d07876b20e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd1320ec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc57ccc6c9a67012ab26976a9141a7ac36cfa8431ab2395d701b0050045ae4a37d188ac68", "6382012088a91420195b5a3d650c17f0f29f91c33f8f6335193d07876b20e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd1320ec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc57ccc6c9a67012ab26976a9141a7ac36cfa8431ab2395d701b0050045ae4a37d188ac68", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_P2WSH_INVALID);
+    Test("or_i(and_b(hash160(20195b5a3d650c17f0f29f91c33f8f6335193d07),a:cms(pk_k(02e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13),424242babaffec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc5)),and_v(v:older(42),pkh(025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc)))", "6382012088a91420195b5a3d650c17f0f29f91c33f8f6335193d07876b20e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd1326424242babaffec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc57ccc6c9a67012ab26976a9141a7ac36cfa8431ab2395d701b0050045ae4a37d188ac68", "6382012088a91420195b5a3d650c17f0f29f91c33f8f6335193d07876b20e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd1326424242babaffec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc57ccc6c9a67012ab26976a9141a7ac36cfa8431ab2395d701b0050045ae4a37d188ac68", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_P2WSH_INVALID);
+    Test("or_i(and_b(hash160(20195b5a3d650c17f0f29f91c33f8f6335193d07),a:cms(pk_k(02e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13),abab42)),and_v(v:older(42),pkh(025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc)))", "6382012088a91420195b5a3d650c17f0f29f91c33f8f6335193d07876b20e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd1303abab427ccc6c9a67012ab26976a9141a7ac36cfa8431ab2395d701b0050045ae4a37d188ac68", "6382012088a91420195b5a3d650c17f0f29f91c33f8f6335193d07876b20e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd1303abab427ccc6c9a67012ab26976a9141a7ac36cfa8431ab2395d701b0050045ae4a37d188ac68", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_P2WSH_INVALID);
+    Test("or_i(and_b(hash160(20195b5a3d650c17f0f29f91c33f8f6335193d07),a:cms(pk_i(),00)),and_v(v:older(42),pkh(025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc)))", "6382012088a91420195b5a3d650c17f0f29f91c33f8f6335193d07876bcb01007ccc6c9a67012ab26976a9141a7ac36cfa8431ab2395d701b0050045ae4a37d188ac68", "6382012088a91420195b5a3d650c17f0f29f91c33f8f6335193d07876bcb01007ccc6c9a67012ab26976a9141a7ac36cfa8431ab2395d701b0050045ae4a37d188ac68", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_P2WSH_INVALID);
+    Test("or_i(r:and_v(v:after(500000),pk_k(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)),sha256(d9147961436944f43cd99d28b2bbddbf452ef872b30c8279e255e7daafc7f946))", "", "630320a107b16920c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5ce7ccc6782012088a820d9147961436944f43cd99d28b2bbddbf452ef872b30c8279e255e7daafc7f9468768", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_P2WSH_INVALID, 12, 2, -1, 2 + 66, 3);
+    Test("and_n(sha256(9267d3dbed802941483f1afa2a6bc68de5f653128aca9bf1461c5d0a3ad36ed2),ur:and_v(v:older(144),pk_k(03fe72c435413d33d48ac09c9161ba8b09683215439d62b7940502bda8b202e6ce)))", "", "82012088a8209267d3dbed802941483f1afa2a6bc68de5f653128aca9bf1461c5d0a3ad36ed28764006763029000b26920fe72c435413d33d48ac09c9161ba8b09683215439d62b7940502bda8b202e6cece7ccc67006868", TESTMODE_VALID | TESTMODE_NEEDSIG | TESTMODE_P2WSH_INVALID, 15, 3, -1, 33 + 2 + 66, 5);
+    Test("r:or_i(and_v(v:older(16),pk_h(02d7924d4f7d43ea965a465ae3095ff41131e5946f3c85f79e44adbcf8e27e080e)),pk_h(026a245bf6dc698504c89a20cfded60853152b695336c28063b61c65cbd269e6b4))", "", "6360b26976a9144d4421361c3289bdad06441ffaee8be8e786f1ad886776a91460d4a7bcbd08f58e58bd208d1069837d7adb16ae8868ce7ccc", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_NEEDSIG | TESTMODE_P2WSH_INVALID, 14, 3, -1, 2 + 33 + 66, 4);
+    Test("or_d(r:pk_h(02e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13),andor(r:pk_k(024ce119c96e2fa357200b559b2f7dd5a5f02d5290aff74b03f3e471b273211c97),older(2016),after(1567547623)))", "", "76a91421ab1a140d0d305b8ff62bdb887d9fef82c9899e88ce7ccc7364204ce119c96e2fa357200b559b2f7dd5a5f02d5290aff74b03f3e471b273211c97ce7ccc6404e7e06e5db16702e007b26868", TESTMODE_VALID | TESTMODE_NONMAL | TESTMODE_P2WSH_INVALID, 17, 3, -1, 1 + 33 + 66, 5);
+    Test("thresh(1,r:pk_k(03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65),altv:after(1000000000),altv:after(100))", "", "20d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65ce7ccc6b6300670400ca9a3bb16951686c936b6300670164b16951686c935187", TESTMODE_VALID | TESTMODE_P2WSH_INVALID, 20, 3, -1, 66 + 2 + 2, 5);
+
+    // Parsing from Script a cms() inside an and_v() will roundtrip to Script
+    constexpr std::array<std::string_view, 2> cms_andv_roundtrip{{
+        "and_v(v:1,andor(cms(pk_k(02f817639b4f4d093dfac1d140c66900b334dac12b5ee3c55f55848e99707e9982),01d0fabd251fcbbe2b93b4b927b26ad2a1a99077152e45ded1e678afa45dbec5),1,1))",
+        "cms(or_i(and_v(andor(cms(or_i(and_v(and_v(v:older(32),andor(cms(pk_k(02f817639b4f4d093dfac1d140c66900b334dac12b5ee3c55f55848e99707e9982),01d0fabd251fcbbe2b93b4b927b26ad2a1a99077152e45ded1e678afa45dbec5),andor(cms(or_i(and_v(andor(cms(or_i(and_v(andor(cms(or_i(and_v(andor(cms(pk_k(02bf32caadf45c2cdc2bb13dab3feae2dcba15a2f48706317049bfda995aa68053),01d0fabd251fcbbe2b93b4b927b26ad2a1a99077152e45ded1e678afa45dbec5),v:0,v:0),pk_k(02f1167c91ea41c69c07a40cdc0044ec2b0bd1b62407fda4b0ab9b293b447688a4)),pk_k(021fe2829d5372a8dcac7aedbc730cd39bc908ce79347b607eb201b6991f327b31)),01d0fabd251fcbbe2b93b4b927b26ad2a1a99077152e45ded1e678afa45dbec5),v:0,v:0),pk_k(0202fa3aca94d4483d83038cdfbbb74f562776a06850f6171a59fa4d678c6850bf)),pk_k(02d18f9cee54aeff1a0096efa173caed11aa458c28564f125c0c5b623c43594727)),01d0fabd251fcbbe2b93b4b927b26ad2a1a99077152e45ded1e678afa45dbec5),v:0,v:0),pk_k(02c733f2397bf6912a68706b8fb700e8446004f5af59c81493b819857a9560ec42)),pk_k(02c28099397961072fb8e41004922a4a9cdd49c1d40ce403b4095b866c2519a232)),01d0fabd251fcbbe2b93b4b927b26ad2a1a99077152e45ded1e678afa45dbec5),v:0,v:0),v:0)),pk_k(020c91cd4bee354b7bf1332b05a6958c513bdc267b3e79f3f47e1735d132b76de5)),pk_k(020b78192fd2aa32166f9bfd48e46db37c0da8d58b4c0946230028b369e7745076)),01d0fabd251fcbbe2b93b4b927b26ad2a1a99077152e45ded1e678afa45dbec5),v:0,v:0),pk_k(029d8f8bf5a4036afbcec9fd79b1f5be61a9e3519973ad529ccac5d896e3076ce3)),pk_k(02fbe7a86aefec0dc6d70251c8ae5c85be58684b8eded6225e1027ea6069fb24a7)),01d0fabd251fcbbe2b93b4b927b26ad2a1a99077152e45ded1e678afa45dbec5)",
+    }};
+    for (const auto ms_str: cms_andv_roundtrip) {
+        const auto ms{miniscript::FromString(std::string{ms_str}, tap_converter)};
+        Assert(ms);
+        const auto script{ms->ToScript(tap_converter)};
+        const auto decoded{miniscript::FromScript(script, tap_converter)};
+        Assert(decoded);
+        BOOST_CHECK(*ms == *decoded);
+    }
+
+    // Parsing from Script an and_v() inside a key expression in a cms() does
+    // not round trip but does yield a top fragment with the same type.
+    {
+        std::string_view andv_in_cms{"cms(and_v(v:0,pk_k(03f817639b4f4d093dfac1d140c66900b334dac12b5ee3c55f55848e99707e9982)),01d0fabd251fcbbe2b93b4b927b26ad2a1a99077152e45ded1e678afa45dbec5)"};
+        const auto ms{miniscript::FromString(std::string{andv_in_cms}, tap_converter)};
+        Assert(ms);
+        const auto script{ms->ToScript(tap_converter)};
+        const auto decoded{miniscript::FromScript(script, tap_converter)};
+        Assert(decoded);
+        BOOST_CHECK(*ms != *decoded);
+        BOOST_CHECK(decoded->GetType() == ms->GetType());
+    }
 
     g_testdata.reset();
 }
