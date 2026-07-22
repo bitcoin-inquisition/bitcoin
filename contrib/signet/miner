@@ -93,10 +93,7 @@ def finish_block(block, signet_solution, grind_cmd):
         block.rehash()
     return block
 
-def generate_psbt(tmpl, reward_spk, *, blocktime=None, poolid=None):
-    signet_spk = tmpl["signet_challenge"]
-    signet_spk_bin = bytes.fromhex(signet_spk)
-
+def generate_block(tmpl, reward_spk, *, blocktime=None, poolid=None):
     scriptSig = script_BIP34_coinbase_height(tmpl["height"])
     if poolid is not None:
         scriptSig = CScript(b"" + scriptSig + CScriptOp.encode_op_pushdata(poolid))
@@ -124,7 +121,13 @@ def generate_psbt(tmpl, reward_spk, *, blocktime=None, poolid=None):
     cbwit.scriptWitness.stack = [ser_uint256(witnonce)]
     block.vtx[0].wit.vtxinwit = [cbwit]
     block.vtx[0].vout.append(CTxOut(0, bytes(get_witness_script(witroot, witnonce))))
+    return block
 
+def generate_psbt(tmpl, reward_spk, *, blocktime=None, poolid=None):
+    block = generate_block(tmpl, reward_spk, blocktime=blocktime, poolid=poolid)
+
+    signet_spk = tmpl["signet_challenge"]
+    signet_spk_bin = bytes.fromhex(signet_spk)
     signme, spendme = signet_txs(block, signet_spk_bin)
 
     psbt = PSBT()
@@ -332,6 +335,28 @@ class Generate:
 
         return tmpl
 
+    def customize(self, bcli, tmpl, reward_spk, poolid, custom):
+        if custom is None: return True # noop
+
+        if "txs" in custom:
+            tmpl["transactions"] = []
+            for override_tx in custom["txs"]:
+                # other fields (txid, hash, depends, fee, sigops, weight) aren't needed by us
+                tmpl["transactions"].append({"data": override_tx})
+            # can't easily calculate fees to collect, so just burn them
+            tmpl["coinbasevalue"] = int(50_0000_0000 >> (tmpl["height"] // 210000))
+
+        block = generate_block(tmpl, reward_spk, blocktime=self.mine_time, poolid=poolid)
+        block.vtx[0].rehash()
+        block.hashMerkleRoot = block.calc_merkle_root()
+        gbt_req = json.dumps(dict(mode="proposal", data=block.serialize().hex())).encode('utf8')
+        result = bcli("-stdin", "getblocktemplate", input=gbt_req)
+        if result is None or result == "":
+            return True # success
+        else:
+            logging.warning(f"Customize failed gbt proposal; result: {result}")
+            return False
+
     def mine(self, bcli, wallets, grind_cmd, tmpl, reward_spk, poolid):
         psbt = generate_psbt(tmpl, reward_spk, blocktime=self.mine_time, poolid=poolid)
         input_stream = os.linesep.join([psbt, "true", "ALL"]).encode('utf8')
@@ -351,6 +376,16 @@ class Generate:
             return None
         block, signet_solution = decode_psbt(psbt_signed["psbt"])
         return finish_block(block, signet_solution, grind_cmd)
+
+def custom_block_info(args, height):
+    if args.custom_block_dir is None: return None
+    p = os.path.join(args.custom_block_dir, f"{height}.json")
+    if not os.path.exists(p): return None
+
+    try:
+        return json.load(open(p, "r"))
+    except:
+        return None
 
 def do_generate(args):
     if args.set_block_time is not None:
@@ -416,6 +451,7 @@ def do_generate(args):
     else:
         prefer_cli = None
 
+
     poolid = get_poolid(args)
     prefer_poolid = get_prefer_poolid(args)
 
@@ -449,8 +485,10 @@ def do_generate(args):
         now = time.time()
         gen.next_block_time(now, bestheader, (mined_blocks == 0))
 
+        custom = custom_block_info(args, int(bestheader["height"]) + 1)
+
         # ready to go? otherwise sleep and check for new block
-        if now < gen.action_time:
+        if custom is None and now < gen.action_time:
             sleep_for = min(gen.action_time - now, 60)
             if gen.mine_time < now:
                 # someone else might have mined the block,
@@ -469,45 +507,44 @@ def do_generate(args):
         logging.debug("Mining block delta=%s start=%s mine=%s", seconds_to_hms(gen.mine_time-bestheader["time"]), gen.mine_time, gen.is_mine)
 
         mined_blocks += 1
-        done = False
+
+        attempts = []
+        if custom is not None:
+            if prefer_cli is not None:
+                attempts.append(("Preferred custom template", prefer_cli, prefer_poolid, custom))
+            else:
+                attempts.append(("Custom template", args.bcli, poolid, custom))
         if prefer_cli is not None:
-            # try gbt via preferred cli
+            attempts.append(("Preferred GBT template", prefer_cli, prefer_poolid, None))
+        attempts.append(("GBT template", args.bcli, poolid, None))
+
+        done = False
+        for (attempt_name, attempt_cli, attempt_poolid, attempt_custom) in attempts:
             try:
-                tmpl = gen.gbt(prefer_cli, bci["bestblockhash"], now)
+                tmpl = gen.gbt(attempt_cli, bci["bestblockhash"], now)
             except:
-                logging.warning("Unable to obtain preferred GBT")
+                logging.warning(f"Unable to obtain {attempt_name}")
                 tmpl = None
-            if tmpl is not None:
-                logging.debug("Preferred GBT template: %s", tmpl)
-                block = gen.mine(args.bcli, wallets, args.grind_cmd, tmpl, reward_spk, poolid=prefer_poolid)
-                if block is None:
-                    logging.warning("Unable to mine preferred template")
+            if tmpl is None: continue
+
+            if not gen.customize(attempt_cli, tmpl, reward_spk, attempt_poolid, attempt_custom): continue
+
+            logging.debug(f"{attempt_name}: {tmpl}")
+            block = gen.mine(args.bcli, wallets, args.grind_cmd, tmpl, reward_spk, poolid=attempt_poolid)
+            if block is None:
+                logging.warning(f"Unable to mine {attempt_name}")
+            else:
+                r = args.bcli("-stdin", "submitblock", input=block.serialize().hex().encode('utf8'))
+                if r is not None and r != "":
+                    logging.warning(f"Unable to submit {attempt_name}; {r}")
                 else:
-                    r = args.bcli("-stdin", "submitblock", input=block.serialize().hex().encode('utf8'))
-                    if r is None or r == "":
-                        done = True
-                    else:
-                        logging.warning("Unable to submit preferred block; %r" % (r,))
+                    done = True
+                    break
 
         if not done:
-            # no preferred GBT or preferred GBT failed
-            tmpl = gen.gbt(args.bcli, bci["bestblockhash"], now)
-            if tmpl is None:
-                logging.warning("Unable to obtain GBT")
-                continue
-
-            logging.debug("GBT template: %s", tmpl)
-            block = gen.mine(args.bcli, wallets, args.grind_cmd, tmpl, reward_spk, poolid=poolid)
-            if block is None:
-                logging.error("Unable to mine template")
-                return 1
-
-            # submit block
-            r = args.bcli("-stdin", "submitblock", input=block.serialize().hex().encode('utf8'))
-            if r is not None and r != "":
-                logging.warning("Unable to submit block; %r" % (r,))
-                continue
-            done = True
+            logging.warning("All attempts to mine block failed, sleeping 10s and retrying")
+            time.sleep(10)
+            continue
 
         # report
         bstr = "block" if gen.is_mine else "backup block"
@@ -595,6 +632,7 @@ def main():
     generate.add_argument("--max-interval", default=1800, type=int, help="Maximum interblock interval (seconds)")
     generate.add_argument("--wallets", default=None, type=str, help="Wallets used for signing, separated by commas")
     generate.add_argument("--nversion", default=None, type=str, help="Override block nVersion (specify as hex)")
+    generate.add_argument("--custom-block-dir", default=None, type=str, help="Directory with <height>.json files to override template")
 
     calibrate = cmds.add_parser("calibrate", help="Calibrate difficulty")
     calibrate.set_defaults(fn=do_calibrate)
