@@ -101,6 +101,8 @@ add_executable(test_bitcoin
   streams_tests.cpp
   sync_tests.cpp
   system_tests.cpp
+  tapscript_v2_json_tests.cpp
+  tapscript_v2_tests.cpp
   timeoffsets_tests.cpp
   torcontrol_tests.cpp
   transaction_tests.cpp
@@ -117,12 +119,16 @@ add_executable(test_bitcoin
   util_tests.cpp
   util_threadnames_tests.cpp
   util_trace_tests.cpp
+  val64_internal_tests.cpp
+  val64_semantics_tests.cpp
   validation_block_tests.cpp
   validation_chainstate_tests.cpp
   validation_chainstatemanager_tests.cpp
   validation_flush_tests.cpp
   validation_tests.cpp
   validationinterface_tests.cpp
+  valtype_stack_tests.cpp
+  varops_tests.cpp
 )
 
 include(TargetDataSources)
@@ -137,8 +143,11 @@ target_json_data_sources(test_bitcoin
   data/key_io_valid.json
   data/script_tests.json
   data/sighash.json
+  data/tapscript_v2_restored_ops.json
+  data/tapscript_v2_varops.json
   data/tx_invalid.json
   data/tx_valid.json
+  data/val64_conversion.json
 )
 target_raw_data_sources(test_bitcoin NAMESPACE test::data
   data/asmap.raw

@@ -179,6 +179,7 @@ static std::string sigver2str(SigVersion sigver)
     case SigVersion::WITNESS_V0: return "witness_v0";
     case SigVersion::TAPROOT: return "taproot";
     case SigVersion::TAPSCRIPT: return "tapscript";
+    case SigVersion::TAPSCRIPT_V2: return "tapscript_v2";
     }
     return "unknown";
 }
@@ -369,7 +370,7 @@ static int EvalScript(const ArgsManager& argsman, const std::vector<std::string>
 
     std::optional<bool> opsuccess_check;
     if (sigversion == SigVersion::TAPSCRIPT) {
-        opsuccess_check = CheckTapscriptOpSuccess(script, flags, &serror);
+        opsuccess_check = CheckTapscriptOpSuccess(script, flags, SigVersion::TAPSCRIPT, &serror);
     }
 
     bool success = (opsuccess_check.has_value() ? *opsuccess_check : EvalScript(stack, script, flags, *Assert(checker), sigversion, execdata, &serror));

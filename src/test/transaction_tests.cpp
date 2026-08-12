@@ -23,10 +23,12 @@
 #include <script/sign.h>
 #include <script/signingprovider.h>
 #include <script/solver.h>
+#include <script/varops.h>
 #include <streams.h>
 #include <test/util/json.h>
 #include <test/util/random.h>
 #include <test/util/script.h>
+#include <test/util/tapscript_v2_test_utils.h>
 #include <test/util/transaction_utils.h>
 #include <util/strencodings.h>
 #include <util/string.h>
@@ -35,6 +37,7 @@
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 
 #include <boost/test/unit_test.hpp>
@@ -51,6 +54,14 @@ static CFeeRate g_dust{DUST_RELAY_TX_FEE};
 static bool g_bare_multi{DEFAULT_PERMIT_BAREMULTISIG};
 
 static const std::map<std::string, script_verify_flag_name>& mapFlagNames = g_verify_flag_names;
+
+static varops::Budget TestVaropsBudget(script_verify_flags flags, const CTransaction& tx)
+{
+    if (flags & SCRIPT_VERIFY_SCRIPT_RESTORATION) {
+        return varops::Budget{varops::TxBudget(GetTransactionWeight(tx))};
+    }
+    return varops::Budget::Unmetered();
+}
 
 script_verify_flags ParseScriptFlags(std::string strFlags)
 {
@@ -88,12 +99,13 @@ bool CheckTxScripts(const CTransaction& tx, const std::map<COutPoint, CScript>& 
 {
     bool tx_valid = true;
     ScriptError err = expect_valid ? SCRIPT_ERR_UNKNOWN_ERROR : SCRIPT_ERR_OK;
+    auto varops_budget{TestVaropsBudget(flags, tx)};
     for (unsigned int i = 0; i < tx.vin.size() && tx_valid; ++i) {
         const CTxIn input = tx.vin[i];
         const CAmount amount = map_prevout_values.count(input.prevout) ? map_prevout_values.at(input.prevout) : 0;
         try {
             tx_valid = VerifyScript(input.scriptSig, map_prevout_scriptPubKeys.at(input.prevout),
-                &input.scriptWitness, flags, TransactionSignatureChecker(&tx, i, amount, txdata, MissingDataBehavior::ASSERT_FAIL), &err);
+                                    &input.scriptWitness, flags, TransactionSignatureChecker(&tx, i, amount, txdata, MissingDataBehavior::ASSERT_FAIL), &err, varops_budget);
         } catch (...) {
             BOOST_ERROR("Bad test: " << strTest);
             return true; // The test format is bad and an error is thrown. Return true to silence further error.
@@ -156,6 +168,48 @@ std::set<script_verify_flags> ExcludeIndividualFlags(script_verify_flags flags)
 }
 
 BOOST_FIXTURE_TEST_SUITE(transaction_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(tapscript_v2_budget_is_shared_across_inputs)
+{
+    constexpr size_t operand_size{7'000};
+    const valtype operand(operand_size, 0xff);
+
+    CScript leaf_script;
+    leaf_script << OP_MUL << OP_DROP << OP_1;
+
+    CScript script_pub_key;
+    const CScriptWitness witness{test::tapscript_v2::BuildTapscriptV2Witness(leaf_script, {operand, operand}, script_pub_key)};
+
+    CMutableTransaction mutable_tx;
+    mutable_tx.version = 2;
+    mutable_tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0});
+    mutable_tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 1});
+    mutable_tx.vin[0].scriptWitness = witness;
+    mutable_tx.vin[1].scriptWitness = witness;
+    mutable_tx.vout.emplace_back(50'000, CScript{} << OP_TRUE);
+
+    const CTransaction tx{mutable_tx};
+    const uint64_t per_input_cost{varops::MulCost(operand_size, operand_size)};
+    const uint64_t tx_budget{varops::TxBudget(GetTransactionWeight(tx))};
+    BOOST_REQUIRE_LT(per_input_cost, tx_budget);
+    BOOST_REQUIRE_LT(tx_budget, 2 * per_input_cost);
+
+    std::map<COutPoint, CScript> prevout_scripts;
+    std::map<COutPoint, int64_t> prevout_values;
+    for (const CTxIn& input : tx.vin) {
+        prevout_scripts.emplace(input.prevout, script_pub_key);
+        prevout_values.emplace(input.prevout, 100'000'000);
+    }
+
+    const script_verify_flags flags{
+        SCRIPT_VERIFY_P2SH |
+        SCRIPT_VERIFY_WITNESS |
+        SCRIPT_VERIFY_TAPROOT |
+        SCRIPT_VERIFY_SCRIPT_RESTORATION};
+    const PrecomputedTransactionData txdata{tx};
+    BOOST_CHECK(CheckTxScripts(tx, prevout_scripts, prevout_values, flags, txdata,
+                               "Tapscript v2 transaction-wide varops budget", /*expect_valid=*/false));
+}
 
 BOOST_AUTO_TEST_CASE(tx_valid)
 {
@@ -547,10 +601,12 @@ BOOST_AUTO_TEST_CASE(test_big_witness_transaction)
     }
 
     SignatureCache signature_cache{DEFAULT_SIGNATURE_CACHE_BYTES};
+    auto varops_budget{std::make_shared<varops::Budget>(varops::TxBudget(GetTransactionWeight(tx)))};
 
     for(uint32_t i = 0; i < mtx.vin.size(); i++) {
         std::vector<CScriptCheck> vChecks;
-        vChecks.emplace_back(coins[tx.vin[i].prevout.n].out, tx, signature_cache, i, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS, false, &txdata);
+        vChecks.emplace_back(coins[tx.vin[i].prevout.n].out, tx, signature_cache, i,
+                             SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS, false, &txdata, varops_budget);
         control.Add(std::move(vChecks));
     }
 

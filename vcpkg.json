@@ -4,6 +4,7 @@
   "builtin-baseline": "c82f74667287d3dc386bce81e44964370c91a289",
   "dependencies": [
     "boost-multi-index",
+    "boost-multiprecision",
     "boost-signals2",
     "libevent"
   ],

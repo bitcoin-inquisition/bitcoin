@@ -2291,11 +2291,9 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
 
     RemoveUnnecessaryTransactions(psbtx, sighash_type);
 
-    // Complete if every input is now signed
-    complete = true;
-    for (size_t i = 0; i < psbtx.inputs.size(); ++i) {
-        complete &= PSBTInputSignedAndVerified(psbtx, i, &txdata);
-    }
+    // Complete if every input is now signed and the transaction-wide varops
+    // budget covers the finalized witnesses.
+    complete = PSBTInputsSignedAndVerified(psbtx, txdata);
 
     return {};
 }

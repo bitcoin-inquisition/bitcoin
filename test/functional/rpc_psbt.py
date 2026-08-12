@@ -29,11 +29,12 @@ from test_framework.psbt import (
     PSBT_IN_SHA256,
     PSBT_IN_HASH160,
     PSBT_IN_HASH256,
+    PSBT_IN_FINAL_SCRIPTSIG,
     PSBT_IN_NON_WITNESS_UTXO,
     PSBT_IN_WITNESS_UTXO,
     PSBT_OUT_TAP_TREE,
 )
-from test_framework.script import CScript, OP_TRUE
+from test_framework.script import CScript, OP_CHECKTEMPLATEVERIFY, OP_DROP, OP_FALSE, OP_TRUE
 from test_framework.script_util import MIN_STANDARD_TX_NONWITNESS_SIZE
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -209,9 +210,72 @@ class PSBTTest(BitcoinTestFramework):
         changepos = psbtx["changepos"]
         assert_equal(decoded_psbt["tx"]["vout"][changepos]["scriptPubKey"]["type"], expected_type)
 
+    def test_finalized_ctv_psbt_precomputation(self):
+        node = self.nodes[0]
+        final_script_sig = CScript([OP_FALSE])
+
+        def make_psbt(commit_final_script_sigs):
+            finalized_tx = CTransaction()
+            finalized_tx.version = 2
+            finalized_tx.vin = [CTxIn(scriptSig=final_script_sig)]
+            finalized_tx.vout = [CTxOut(nValue=150_000, scriptPubKey=CScript([OP_TRUE]))]
+
+            if commit_final_script_sigs:
+                template_hash = finalized_tx.get_standard_template_hash(0)
+            else:
+                finalized_tx.vin[0].scriptSig = b""
+                template_hash = finalized_tx.get_standard_template_hash(0)
+                finalized_tx.vin[0].scriptSig = final_script_sig
+
+            ctv_script = CScript([OP_DROP, template_hash, OP_CHECKTEMPLATEVERIFY])
+            prev_tx = CTransaction()
+            prev_tx.version = 2
+            prev_tx.vin = [CTxIn(COutPoint(hash=int("11" * 32, 16), n=0), CScript([OP_TRUE]))]
+            prev_tx.vout = [CTxOut(nValue=200_000, scriptPubKey=ctv_script)]
+            prev_tx.rehash()
+
+            finalized_tx.vin[0].prevout = COutPoint(hash=int(prev_tx.hash, 16), n=0)
+            finalized_tx.rehash()
+
+            unsigned_tx = CTransaction()
+            unsigned_tx.version = finalized_tx.version
+            unsigned_tx.vin = [CTxIn(COutPoint(hash=finalized_tx.vin[0].prevout.hash, n=0))]
+            unsigned_tx.vout = [CTxOut(nValue=txout.nValue, scriptPubKey=txout.scriptPubKey) for txout in finalized_tx.vout]
+
+            psbt = PSBT(
+                g=PSBTMap({PSBT_GLOBAL_UNSIGNED_TX: unsigned_tx.serialize_without_witness()}),
+                i=[PSBTMap({
+                    PSBT_IN_NON_WITNESS_UTXO: prev_tx.serialize_without_witness(),
+                    PSBT_IN_FINAL_SCRIPTSIG: final_script_sig,
+                })],
+                o=[PSBTMap() for _ in unsigned_tx.vout],
+            )
+            return psbt.to_base64(), finalized_tx.serialize_without_witness().hex()
+
+        valid_psbt, valid_hex = make_psbt(commit_final_script_sigs=True)
+        analysis = node.analyzepsbt(valid_psbt)
+        assert_equal(analysis["next"], "extractor")
+        assert "error" not in analysis
+
+        finalized = node.finalizepsbt(valid_psbt)
+        assert_equal(finalized["complete"], True)
+        assert_equal(finalized["hex"], valid_hex)
+
+        invalid_psbt, _ = make_psbt(commit_final_script_sigs=False)
+        analysis = node.analyzepsbt(invalid_psbt)
+        assert_equal(analysis["next"], "creator")
+        assert_equal(analysis["error"], "PSBT is not valid. Finalized transaction failed script verification")
+
+        finalized = node.finalizepsbt(invalid_psbt)
+        assert_equal(finalized["complete"], False)
+        assert "hex" not in finalized
+
     def run_test(self):
         # Create and fund a raw tx for sending 10 BTC
         psbtx1 = self.nodes[0].walletcreatefundedpsbt([], {self.nodes[2].getnewaddress():10})['psbt']
+
+        self.log.info("Test finalized PSBT precomputation with non-empty CTV scriptSigs")
+        self.test_finalized_ctv_psbt_precomputation()
 
         self.log.info("Test for invalid maximum transaction weights")
         dest_arg = [{self.nodes[0].getnewaddress(): 1}]

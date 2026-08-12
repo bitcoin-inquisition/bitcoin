@@ -10,6 +10,7 @@
 #include <policy/settings.h>
 #include <tinyformat.h>
 
+#include <algorithm>
 #include <numeric>
 
 namespace node {
@@ -25,6 +26,9 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
     result.inputs.resize(psbtx.tx->vin.size());
 
     const PrecomputedTransactionData txdata = PrecomputePSBTData(psbtx);
+    const bool all_inputs_finalized{std::all_of(psbtx.inputs.begin(), psbtx.inputs.end(), [](const PSBTInput& input) {
+        return PSBTInputSigned(input);
+    })};
 
     for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
         PSBTInput& input = psbtx.inputs[i];
@@ -59,7 +63,9 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
         }
 
         // Check if it is final
-        if (!PSBTInputSignedAndVerified(psbtx, i, &txdata)) {
+        if (all_inputs_finalized && !utxo.IsNull()) {
+            input_analysis.is_final = true;
+        } else if (!PSBTInputSignedAndVerified(psbtx, i, &txdata)) {
             input_analysis.is_final = false;
 
             // Figure out what is missing
@@ -94,6 +100,11 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
         result.next = std::min(result.next, input_analysis.next);
     }
     assert(result.next > PSBTRole::CREATOR);
+
+    if (result.next == PSBTRole::EXTRACTOR && !PSBTInputsSignedAndVerified(psbtx, txdata)) {
+        result.SetInvalid("PSBT is not valid. Finalized transaction failed script verification");
+        return result;
+    }
 
     if (calc_fee) {
         // Get the output amount

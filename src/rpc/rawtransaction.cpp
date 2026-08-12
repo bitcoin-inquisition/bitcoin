@@ -555,7 +555,7 @@ static RPCHelpMan decodescript()
         for (CScript::const_iterator it{script.begin()}; it != script.end();) {
             opcodetype op;
             CHECK_NONFATAL(script.GetOp(it, op));
-            if (op == OP_CHECKSIGADD || IsOpSuccess(op)) {
+            if (op == OP_CHECKSIGADD || IsOpSuccess(op, SigVersion::TAPSCRIPT)) {
                 return false;
             }
         }
@@ -1977,6 +1977,12 @@ RPCHelpMan descriptorprocesspsbt()
         complete &= PSBTInputSigned(input);
     }
 
+    CMutableTransaction mtx;
+    if (complete) {
+        PartiallySignedTransaction psbtx_copy = psbtx;
+        complete = FinalizeAndExtractPSBT(psbtx_copy, mtx);
+    }
+
     DataStream ssTx{};
     ssTx << psbtx;
 
@@ -1985,9 +1991,6 @@ RPCHelpMan descriptorprocesspsbt()
     result.pushKV("psbt", EncodeBase64(ssTx));
     result.pushKV("complete", complete);
     if (complete) {
-        CMutableTransaction mtx;
-        PartiallySignedTransaction psbtx_copy = psbtx;
-        CHECK_NONFATAL(FinalizeAndExtractPSBT(psbtx_copy, mtx));
         DataStream ssTx_final;
         ssTx_final << TX_WITH_WITNESS(mtx);
         result.pushKV("hex", HexStr(ssTx_final));

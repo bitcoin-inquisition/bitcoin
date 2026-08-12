@@ -9,6 +9,7 @@
 # ------------
 # Suppressions in dependencies that are developed outside this repository.
 unsigned-integer-overflow:*/include/c++/
+unsigned-integer-overflow:*/include/boost/multiprecision/
 unsigned-integer-overflow:FuzzedDataProvider::ConsumeIntegralInRange
 unsigned-integer-overflow:leveldb/
 unsigned-integer-overflow:minisketch/

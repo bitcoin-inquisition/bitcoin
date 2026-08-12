@@ -4,9 +4,11 @@
 
 #include <psbt.h>
 
+#include <consensus/validation.h>
 #include <node/types.h>
 #include <policy/policy.h>
 #include <script/signingprovider.h>
+#include <script/varops.h>
 #include <util/check.h>
 #include <util/strencodings.h>
 
@@ -295,6 +297,18 @@ bool PSBTInputSigned(const PSBTInput& input)
     return !input.final_script_sig.empty() || !input.final_script_witness.IsNull();
 }
 
+// PSBT transactions omit final scriptSigs and witnesses.
+static CMutableTransaction GetFinalizedPSBTTransaction(const PartiallySignedTransaction& psbt)
+{
+    CMutableTransaction mtx{*psbt.tx};
+    for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
+        const PSBTInput& input{psbt.inputs.at(i)};
+        mtx.vin[i].scriptSig = input.final_script_sig;
+        mtx.vin[i].scriptWitness = input.final_script_witness;
+    }
+    return mtx;
+}
+
 bool PSBTInputSignedAndVerified(const PartiallySignedTransaction psbt, unsigned int input_index, const PrecomputedTransactionData* txdata)
 {
     CTxOut utxo;
@@ -317,11 +331,39 @@ bool PSBTInputSignedAndVerified(const PartiallySignedTransaction psbt, unsigned 
         return false;
     }
 
+    // An incomplete PSBT's finalized weight is a conservative lower bound on its eventual varops budget.
+    const CTransaction finalized_tx{GetFinalizedPSBTTransaction(psbt)};
+    varops::Budget varops_budget{varops::TxBudget(GetTransactionWeight(finalized_tx))};
     if (txdata) {
-        return VerifyScript(input.final_script_sig, utxo.scriptPubKey, &input.final_script_witness, STANDARD_SCRIPT_VERIFY_FLAGS, MutableTransactionSignatureChecker{&(*psbt.tx), input_index, utxo.nValue, *txdata, MissingDataBehavior::FAIL});
+        return VerifyScript(input.final_script_sig, utxo.scriptPubKey, &input.final_script_witness,
+                            STANDARD_SCRIPT_VERIFY_FLAGS,
+                            MutableTransactionSignatureChecker{&(*psbt.tx), input_index, utxo.nValue, *txdata, MissingDataBehavior::FAIL},
+                            nullptr, varops_budget);
     } else {
-        return VerifyScript(input.final_script_sig, utxo.scriptPubKey, &input.final_script_witness, STANDARD_SCRIPT_VERIFY_FLAGS, MutableTransactionSignatureChecker{&(*psbt.tx), input_index, utxo.nValue, MissingDataBehavior::FAIL});
+        return VerifyScript(input.final_script_sig, utxo.scriptPubKey, &input.final_script_witness,
+                            STANDARD_SCRIPT_VERIFY_FLAGS,
+                            MutableTransactionSignatureChecker{&(*psbt.tx), input_index, utxo.nValue, MissingDataBehavior::FAIL},
+                            nullptr, varops_budget);
     }
+}
+
+bool PSBTInputsSignedAndVerified(const PartiallySignedTransaction& psbt, const PrecomputedTransactionData& psbt_txdata)
+{
+    const CTransaction tx{GetFinalizedPSBTTransaction(psbt)};
+    if (!psbt_txdata.m_spent_outputs_ready) return false;
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx, std::vector<CTxOut>{psbt_txdata.m_spent_outputs}, true);
+    varops::Budget varops_budget{varops::TxBudget(GetTransactionWeight(tx))};
+
+    for (unsigned int i = 0; i < tx.vin.size(); ++i) {
+        const CTxOut& utxo{psbt_txdata.m_spent_outputs[i]};
+        if (!VerifyScript(tx.vin[i].scriptSig, utxo.scriptPubKey, &tx.vin[i].scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker{&tx, i, utxo.nValue, txdata, MissingDataBehavior::FAIL}, nullptr, varops_budget)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 size_t CountPSBTUnsignedInputs(const PartiallySignedTransaction& psbt) {
@@ -489,7 +531,7 @@ bool FinalizePSBT(PartiallySignedTransaction& psbtx)
         complete &= SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, &txdata, SIGHASH_ALL, nullptr, true);
     }
 
-    return complete;
+    return complete && PSBTInputsSignedAndVerified(psbtx, txdata);
 }
 
 bool FinalizeAndExtractPSBT(PartiallySignedTransaction& psbtx, CMutableTransaction& result)
@@ -500,11 +542,7 @@ bool FinalizeAndExtractPSBT(PartiallySignedTransaction& psbtx, CMutableTransacti
         return false;
     }
 
-    result = *psbtx.tx;
-    for (unsigned int i = 0; i < result.vin.size(); ++i) {
-        result.vin[i].scriptSig = psbtx.inputs[i].final_script_sig;
-        result.vin[i].scriptWitness = psbtx.inputs[i].final_script_witness;
-    }
+    result = GetFinalizedPSBTTransaction(psbtx);
     return true;
 }
 

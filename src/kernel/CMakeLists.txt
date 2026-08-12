@@ -53,6 +53,8 @@ add_library(bitcoinkernel
   ../script/script_error.cpp
   ../script/sigcache.cpp
   ../script/solver.cpp
+  ../script/val64.cpp
+  ../script/valtype_stack.cpp
   ../signet.cpp
   ../streams.cpp
   ../support/lockedpool.cpp

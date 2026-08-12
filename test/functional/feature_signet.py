@@ -61,7 +61,23 @@ class SignetBasicTest(BitcoinTestFramework):
         self.connect_nodes(2, 3)
         self.connect_nodes(4, 5)
 
+    def check_script_restoration_deployment(self):
+        for node_idx in (0, 2, 4):
+            deployment = self.nodes[node_idx].getdeploymentinfo()["deployments"]["script_restoration"]
+            assert_equal(deployment["type"], "heretical")
+            assert_equal(deployment["active"], False)
+
+            heretical = deployment["heretical"]
+            assert_equal(heretical["binana-id"], "BIN-2026-0441-000")
+            assert_equal(heretical["start_time"], 1767225600)
+            assert_equal(heretical["timeout"], 2082758400)
+            assert_equal(heretical["period"], 432)
+            assert_equal(heretical["status"], "defined")
+
     def run_test(self):
+        self.log.info("SCRIPT_RESTORATION signet deployment parameters")
+        self.check_script_restoration_deployment()
+
         self.log.info("basic tests using OP_TRUE challenge")
 
         self.log.info('getblockchaininfo')

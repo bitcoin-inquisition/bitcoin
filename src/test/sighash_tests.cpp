@@ -595,6 +595,29 @@ BOOST_AUTO_TEST_CASE(sighash_anyprevout_taproot)
     #endif
 }
 
+BOOST_AUTO_TEST_CASE(sighash_anyprevout_is_not_tapscript_v2)
+{
+    CMutableTransaction tx;
+    RandomTransaction(tx, /*fSingle=*/false);
+    std::for_each(tx.vin.begin(), tx.vin.end(), [](CTxIn& vin){ vin.scriptWitness.stack.push_back({OP_TRUE}); });
+    PrecomputedTransactionData txdata(tx);
+    txdata.Init(tx, MutateSpentOutputs(tx.vin.size(), false, false));
+    const uint32_t nIn{static_cast<uint32_t>(m_rng.randrange(tx.vin.size()))};
+
+    ScriptExecutionData execdata;
+    execdata.m_annex_init = true;
+    execdata.m_annex_present = false;
+    execdata.m_tapleaf_hash_init = true;
+    execdata.m_tapleaf_hash = m_rng.rand256();
+    execdata.m_codeseparator_pos_init = true;
+    execdata.m_codeseparator_pos = 0xFFFFFFFF;
+
+    const uint8_t hash_type{uint8_t{SIGHASH_ANYPREVOUT | SIGHASH_ALL}};
+    uint256 hash;
+    BOOST_CHECK(SignatureHashSchnorr(hash, execdata, tx, nIn, hash_type, SigVersion::TAPSCRIPT, KeyVersion::ANYPREVOUT, txdata, MissingDataBehavior::ASSERT_FAIL));
+    BOOST_CHECK(!SignatureHashSchnorr(hash, execdata, tx, nIn, hash_type, SigVersion::TAPSCRIPT_V2, KeyVersion::ANYPREVOUT, txdata, MissingDataBehavior::ASSERT_FAIL));
+}
+
 BOOST_AUTO_TEST_CASE(sighash_caching)
 {
     // Get a script, transaction and parameters as inputs to the sighash function.

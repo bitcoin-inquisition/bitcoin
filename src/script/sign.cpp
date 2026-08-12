@@ -6,6 +6,7 @@
 #include <script/sign.h>
 
 #include <consensus/amount.h>
+#include <consensus/validation.h>
 #include <key.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
@@ -14,6 +15,7 @@
 #include <script/script.h>
 #include <script/signingprovider.h>
 #include <script/solver.h>
+#include <script/varops.h>
 #include <uint256.h>
 #include <util/translation.h>
 #include <util/vector.h>
@@ -61,7 +63,7 @@ bool MutableTransactionSignatureCreator::CreateSig(const SigningProvider& provid
 
 bool MutableTransactionSignatureCreator::CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* merkle_root, SigVersion sigversion) const
 {
-    assert(sigversion == SigVersion::TAPROOT || sigversion == SigVersion::TAPSCRIPT);
+    assert(sigversion == SigVersion::TAPROOT || IsTapscript(sigversion));
 
     CKey key;
     if (!provider.GetKeyByXOnly(pubkey, key)) return false;
@@ -74,7 +76,7 @@ bool MutableTransactionSignatureCreator::CreateSchnorrSig(const SigningProvider&
     ScriptExecutionData execdata;
     execdata.m_annex_init = true;
     execdata.m_annex_present = false; // Only support annex-less signing for now.
-    if (sigversion == SigVersion::TAPSCRIPT) {
+    if (IsTapscript(sigversion)) {
         execdata.m_codeseparator_pos_init = true;
         execdata.m_codeseparator_pos = 0xFFFFFFFF; // Only support non-OP_CODESEPARATOR BIP342 signing for now.
         if (!leaf_hash) return false; // BIP342 signing needs leaf hash.
@@ -285,12 +287,16 @@ struct WshSatisfier: Satisfier<CPubKey> {
 /** Miniscript satisfier specific to Tapscript context. */
 struct TapSatisfier: Satisfier<XOnlyPubKey> {
     const uint256& m_leaf_hash;
+    const SigVersion m_sigversion;
 
     explicit TapSatisfier(const SigningProvider& provider LIFETIMEBOUND, SignatureData& sig_data LIFETIMEBOUND,
                           const BaseSignatureCreator& creator LIFETIMEBOUND, const CScript& script LIFETIMEBOUND,
-                          const uint256& leaf_hash LIFETIMEBOUND)
+                          const uint256& leaf_hash LIFETIMEBOUND, SigVersion sigversion)
                           : Satisfier(provider, sig_data, creator, script, miniscript::MiniscriptContext::TAPSCRIPT),
-                            m_leaf_hash(leaf_hash) {}
+                            m_leaf_hash(leaf_hash), m_sigversion(sigversion)
+    {
+        assert(IsTapscript(m_sigversion));
+    }
 
     //! Conversion from a raw xonly public key.
     template <typename I>
@@ -310,7 +316,7 @@ struct TapSatisfier: Satisfier<XOnlyPubKey> {
 
     //! Satisfy a BIP340 signature check.
     miniscript::Availability Sign(const XOnlyPubKey& key, std::vector<unsigned char>& sig) const {
-        if (CreateTaprootScriptSig(m_creator, m_sig_data, m_provider, sig, key, m_leaf_hash, SigVersion::TAPSCRIPT)) {
+        if (CreateTaprootScriptSig(m_creator, m_sig_data, m_provider, sig, key, m_leaf_hash, m_sigversion)) {
             return miniscript::Availability::YES;
         }
         return miniscript::Availability::NO;
@@ -319,13 +325,14 @@ struct TapSatisfier: Satisfier<XOnlyPubKey> {
 
 static bool SignTaprootScript(const SigningProvider& provider, const BaseSignatureCreator& creator, SignatureData& sigdata, int leaf_version, Span<const unsigned char> script_bytes, std::vector<valtype>& result)
 {
-    // Only BIP342 tapscript signing is supported for now.
-    if (leaf_version != TAPROOT_LEAF_TAPSCRIPT) return false;
+    // Only the supported tapscript leaf versions can be signed.
+    if (leaf_version != TAPROOT_LEAF_TAPSCRIPT && leaf_version != TAPROOT_LEAF_TAPSCRIPT_V2) return false;
 
     uint256 leaf_hash = ComputeTapleafHash(leaf_version, script_bytes);
     CScript script = CScript(script_bytes.begin(), script_bytes.end());
+    const SigVersion sigversion{leaf_version == TAPROOT_LEAF_TAPSCRIPT_V2 ? SigVersion::TAPSCRIPT_V2 : SigVersion::TAPSCRIPT};
 
-    TapSatisfier ms_satisfier{provider, sigdata, creator, script, leaf_hash};
+    TapSatisfier ms_satisfier{provider, sigdata, creator, script, leaf_hash, sigversion};
     const auto ms = miniscript::FromScript(script, ms_satisfier);
     return ms && ms->Satisfy(ms_satisfier, result) == miniscript::Availability::YES;
 }
@@ -784,7 +791,8 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
             spent_outputs.emplace_back(coin->second.out.nValue, coin->second.out.scriptPubKey);
         }
     }
-    if (spent_outputs.size() == mtx.vin.size()) {
+    const bool have_all_spent_outputs{spent_outputs.size() == mtx.vin.size()};
+    if (have_all_spent_outputs) {
         txdata.Init(txConst, std::move(spent_outputs), true);
     }
 
@@ -829,5 +837,23 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
             input_errors.erase(i);
         }
     }
+
+    if (input_errors.empty() && have_all_spent_outputs) {
+        const CTransaction signed_tx{mtx};
+        PrecomputedTransactionData signed_txdata;
+        auto finalized_spent_outputs{txdata.m_spent_outputs};
+        signed_txdata.Init(signed_tx, std::move(finalized_spent_outputs), true);
+        varops::Budget varops_budget{varops::TxBudget(GetTransactionWeight(signed_tx))};
+
+        for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
+            const CTxOut& spent_output{signed_txdata.m_spent_outputs[i]};
+            ScriptError serror{SCRIPT_ERR_OK};
+            if (!VerifyScript(mtx.vin[i].scriptSig, spent_output.scriptPubKey, &mtx.vin[i].scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker(&signed_tx, i, spent_output.nValue, signed_txdata, MissingDataBehavior::FAIL), &serror, varops_budget)) {
+                input_errors[i] = Untranslated(ScriptErrorString(serror));
+                break;
+            }
+        }
+    }
+
     return input_errors.empty();
 }

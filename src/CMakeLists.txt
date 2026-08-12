@@ -120,6 +120,8 @@ add_library(bitcoin_consensus STATIC EXCLUDE_FROM_ALL
   script/interpreter.cpp
   script/script.cpp
   script/script_error.cpp
+  script/valtype_stack.cpp
+  script/val64.cpp
   uint256.cpp
 )
 target_link_libraries(bitcoin_consensus
