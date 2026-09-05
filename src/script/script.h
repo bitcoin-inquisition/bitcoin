@@ -64,6 +64,15 @@ static constexpr int64_t VALIDATION_WEIGHT_PER_SIGOP_PASSED{50};
 // How much weight budget is added to the witness size (Tapscript only, see BIP 342).
 static constexpr int64_t VALIDATION_WEIGHT_OFFSET{50};
 
+// Validation weight per OP_CHECKCONTRACTVERIFY with 1 tweak (Tapscript only, see BIP 443).
+// TODO: figure out what is the right weight.
+// Rationale for 25: while CheckDoubleTweak with 2 tweaks costs about 60% more than a
+// Schnorr sig check, caching could be implemented so that the same input/output is checked
+// several times. The cost with a single tweak is half of that. The cost of hashing is
+// negligible in comparison, as it is bound by MAX_SCRIPT_ELEMENT_SIZE bytes. The rest of
+// the opcode evaluation is negligible.
+static constexpr int64_t VALIDATION_WEIGHT_PER_CCV_TWEAK{25};
+
 template <typename T>
 std::vector<unsigned char> ToByteVector(const T& in)
 {
